@@ -1,0 +1,13 @@
+ccxt
+pandas
+ta
+python-dotenv
+google-genai
+plotly
+matplotlib
+scipy
+xgboost
+scikit-learn
+boto3
+requests
+hyperliquid-python-sdk

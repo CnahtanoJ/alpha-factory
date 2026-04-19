@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+env/
+venv/
+ENV/
+
+# Databases
+*.db
+*.sqlite3
+
+# Environment & Secrets
+.env
+.env.*
+!.env.example
+secrets.json
+
+# Data & Large Files
+data/
+downloads/
+*.zip
+*.csv
+*.json
+!elite_squad.json
+!champion_blueprint.json
+!all_grid_results.json
+!analytics/models/*.json
+!analytics/models/*.pkl
+
+# Reports
+weekly_intelligence_report.md
+
+# IDEs
+.vscode/
+.idea/
+.DS_Store
+
+# Misc
+*.log
+scratch/old_*
