@@ -121,6 +121,40 @@ def get_latest_candles(symbol, interval='1h', limit=100, testnet=False, hl_map=N
         print(f"Error fetching HL candles for {symbol} ({hl_api_string}): {e}")
         return []
 
+def get_hl_top_by_volume(limit=100):
+    """
+    Fetches the top N assets on Hyperliquid by 24h volume.
+    Returns a list of symbol names.
+    """
+    import requests
+    import json
+    
+    url = "https://api.hyperliquid.xyz/info"
+    headers = {"Content-Type": "application/json"}
+    payload = {"type": "metaAndAssetCtxs"}
+    
+    try:
+        response = requests.post(url, headers=headers, data=json.dumps(payload), timeout=10)
+        if response.status_code == 200:
+            data = response.json()
+            # meta = data[0], asset_ctxs = data[1]
+            meta = data[0]
+            ctxs = data[1]
+            
+            assets = []
+            for i, asset_meta in enumerate(meta['universe']):
+                name = asset_meta['name']
+                ctx = ctxs[i]
+                # dayNtlVlm is the 24h volume
+                day_vol = float(ctx.get('dayNtlVlm', 0))
+                assets.append({'name': name, 'volume': day_vol})
+                
+            assets.sort(key=lambda x: x['volume'], reverse=True)
+            return [a['name'] for a in assets[:limit]]
+    except Exception as e:
+        print(f"Error fetching top HL assets: {e}")
+    return []
+
 if __name__ == "__main__":
     uni = get_hyperliquid_universe()
     print(f"Found {len(uni)} active Hyperliquid markets.")

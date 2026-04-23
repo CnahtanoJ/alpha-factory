@@ -20,7 +20,6 @@ def get_connection():
 def init_db():
     conn = get_connection()
     # OHLCV Table - Stores the actual candle data
-    # market: 'spot' or 'futures'
     conn.execute('''
         CREATE TABLE IF NOT EXISTS ohlcv (
             timestamp INTEGER,
@@ -36,15 +35,48 @@ def init_db():
         )
     ''')
 
+    # Index Price OHLCV Table
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS index_ohlcv (
+            timestamp INTEGER,
+            symbol TEXT,
+            timeframe TEXT,
+            open REAL,
+            high REAL,
+            low REAL,
+            close REAL,
+            PRIMARY KEY (symbol, timeframe, timestamp)
+        )
+    ''')
+
+    # Symbol Metrics Table
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS symbol_metrics (
+            timestamp INTEGER,
+            create_time INTEGER,
+            symbol TEXT,
+            sum_open_interest REAL,
+            sum_open_interest_value REAL,
+            count_toptrader_long_short_ratio REAL,
+            sum_toptrader_long_short_ratio REAL,
+            count_long_short_ratio REAL,
+            sum_long_short_ratio REAL,
+            count_taker_long_short_vol_ratio REAL,
+            sum_taker_long_short_vol_ratio REAL,
+            PRIMARY KEY (symbol, timestamp)
+        )
+    ''')
+
     # Sync State Table - Tracks progress for smart resuming
     conn.execute('''
         CREATE TABLE IF NOT EXISTS sync_state (
             symbol TEXT,
             timeframe TEXT,
             market TEXT,
+            data_type TEXT DEFAULT 'klines',
             earliest_timestamp INTEGER,
             latest_timestamp INTEGER,
-            PRIMARY KEY (symbol, timeframe, market)
+            PRIMARY KEY (symbol, timeframe, market, data_type)
         )
     ''')
     
