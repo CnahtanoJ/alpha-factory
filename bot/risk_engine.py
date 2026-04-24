@@ -263,7 +263,7 @@ class RiskEngine:
         limit_buy_px = self.assets.get_price_precision(coin, raw_limit_buy)
         limit_sell_px = self.assets.get_price_precision(coin, raw_limit_sell)
         
-        entry_usd = (equity * 1.7)
+        entry_usd = (equity * 0.25) # 25% of equity per leg for market-neutral basket (1.5x total leverage across 6 assets)
         base_sz_unit = entry_usd / mid_px
                 
         # 4. DECISION LOGIC 🧠

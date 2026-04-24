@@ -155,6 +155,40 @@ def get_hl_top_by_volume(limit=100):
         print(f"Error fetching top HL assets: {e}")
     return []
 
+def get_live_meta_ctx():
+    """
+    Fetches the live metaAndAssetCtxs and returns a dictionary mapped by symbol name.
+    Useful for live inference of funding, OI, and oracle price.
+    Returns: {'BTC': {'funding': 0.0001, 'openInterest': 100.5, 'oraclePx': 65000.0}, ...}
+    """
+    import requests
+    import json
+    
+    url = "https://api.hyperliquid.xyz/info"
+    headers = {"Content-Type": "application/json"}
+    payload = {"type": "metaAndAssetCtxs"}
+    
+    live_data = {}
+    try:
+        response = requests.post(url, headers=headers, data=json.dumps(payload), timeout=10)
+        if response.status_code == 200:
+            data = response.json()
+            meta = data[0]
+            ctxs = data[1]
+            
+            for i, asset_meta in enumerate(meta['universe']):
+                name = asset_meta['name']
+                ctx = ctxs[i]
+                live_data[name] = {
+                    'funding': float(ctx.get('funding', 0)),
+                    'openInterest': float(ctx.get('openInterest', 0)),
+                    'oraclePx': float(ctx.get('oraclePx', 0))
+                }
+    except Exception as e:
+        print(f"Error fetching live meta ctx: {e}")
+        
+    return live_data
+
 if __name__ == "__main__":
     uni = get_hyperliquid_universe()
     print(f"Found {len(uni)} active Hyperliquid markets.")

@@ -18,83 +18,47 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
-class HyperliquidBot:
-    def __init__(self, exchange, info, coin, timeframe, bucket, strategy, risk_engine):
-        self.exchange = exchange
+class LiveInferenceEngine:
+    def __init__(self, info):
         self.info = info
-        self.address = exchange.account_address 
-        self.coin = coin
-        self.timeframe = timeframe
-        self.strategy = strategy
-        self.md = MarketData(self.info)
-        self.risk = risk_engine
 
-    def run_tick(self, portfolio, user_state):
+    def build_live_features(self, symbol, candles, ctx):
+        if not candles: return None
+        df = pd.DataFrame(candles)
+        # candles have t, o, h, l, c, v
+        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+        df = df.sort_values('timestamp').reset_index(drop=True)
         
-        # 1. 🛡️ ACCOUNT SAFETY FIRST 
-        if not self.risk.check_safety(user_state): 
-            logger.warning("❌ Safety Check Failed. Aborting tick.")
-            return
-            
-        # 2. 📥 SINGLE DATA FETCH
-        df = self.md.get_clean_candles(self.coin, interval=self.timeframe, limit=1000)
-        if df.empty: 
-            logger.warning(f"⚠️ {self.coin}: Failed to fetch data.")
-            return
-
-        # 3. 🫀 THE HEARTBEAT: Calculate ATR immediately
-        high, low = df['high'], df['low']
-        prev_close = df['close'].shift(1)
-        tr = pd.concat([high - low, (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
-        df['atr_pct'] = (tr.rolling(14).mean() / df['close'])
+        df['index_close'] = ctx.get('oraclePx', df['close'].iloc[-1])
+        df['sum_open_interest'] = ctx.get('openInterest', 0)
+        df['last_funding_rate'] = ctx.get('funding', 0)
         
-        current_atr_pct = float(df['atr_pct'].iloc[-1]) if pd.notna(df['atr_pct'].iloc[-1]) else 0.015
-
-        open_orders = self.info.frontend_open_orders(self.address)
-        # 4. 🧹 RISK CLEANUP
-        self.risk.clean_global_zombies(portfolio, open_orders)
-        self.risk.sync_break_even(self.coin, current_atr_pct, portfolio, open_orders)
-
-        # 5. 🧠 THE BRAIN (Get Signals First!)
-        signals = self.strategy.get_signal_column(df)
-        last_closed_time = df.index[-2]
-        current_signal = signals.iloc[-2] 
-
-        # 🚀 EARLY EXIT: Save server CPU if there is no signal to act on
-        if current_signal == 0:
-            logger.info(f"Neutral for {self.coin} | Last Closed: {last_closed_time}")
-            return 
-
-        # 6. 🔍 HEAVY EXECUTION MATH (Only runs if a signal fired)
-        logger.info(f"🔍 Analyzing Candle: {last_closed_time} | Signal: {current_signal}")
+        # We need historical metrics to do rolling z-score. For live Lambda without DB, we approximate or default to 0
+        # Since we only have the snapshot of OI, we can't do rolling 50. 
+        # But for cross-sectional ranking, the absolute OI rank is a proxy for high OI.
+        df['oi_zscore'] = 0 
+        df['funding_delta'] = 0 # Cannot diff without historical funding
+        df['basis_pct'] = (df['close'] - df['index_close']) / df['index_close']
         
-        poc_price = get_local_poc(df, num_bins=50, lookback=200)
-        signal_price = df['close'].iloc[-2]
-        current_price = df['close'].iloc[-1]
-        cvd_slope = get_cvd_slope(df, lookback=5)
-        cvd_text = f"CVD Slope: {cvd_slope:,.0f}"
-
-        # 7. 🚦 THE BOUNCER INTEGRATION
-        if current_signal == 1: 
-            if self.risk.check_execution_safety(self.coin, is_buy=True, current_price=current_price, poc_price=poc_price):
-                msg = f"🟢 BULLISH FOR {self.coin}\n📊 Signal Formed At: ${signal_price:.4f}\n💵 Live Entry: ~${current_price:.4f}\n🧲 POC Magnet: ${poc_price:.4f}\n{cvd_text}"
-                send_telegram_message(msg)
-                self.risk.execute_logic(self.coin, "BULLISH", self.timeframe, current_atr_pct, portfolio, user_state, open_orders)
-            else:
-                logger.info(f"🚫 BULLISH signal on {self.coin} blocked by Live Sensor.")
-
-        elif current_signal == -1: 
-            if self.risk.check_execution_safety(self.coin, is_buy=False, current_price=current_price, poc_price=poc_price):
-                msg = f"🔴 BEARISH FOR {self.coin}\n📊 Signal Formed At: ${signal_price:.4f}\n💵 Live Entry: ~${current_price:.4f}\n🧲 POC Magnet: ${poc_price:.4f}\n{cvd_text}"
-                send_telegram_message(msg)
-                self.risk.execute_logic(self.coin, "BEARISH", self.timeframe, current_atr_pct, portfolio, user_state, open_orders)
-            else:
-                logger.info(f"🚫 BEARISH signal on {self.coin} blocked by Live Sensor.")
-
-        elif current_signal == 2:
-            if self.coin in portfolio:
-                send_telegram_message(f"💨 THESIS INVALIDATED. FULLY EXITING {self.coin}!")
-                self.risk.execute_logic(self.coin, "EXIT", self.timeframe, current_atr_pct, portfolio, user_state, open_orders)
+        from bot.strategies import STRATEGY_CONFIG
+        from ta.momentum import RSIIndicator
+        from ta.trend import MACD
+        
+        df['rsi'] = RSIIndicator(close=df['close'], window=14).rsi()
+        macd = MACD(close=df['close'], window_slow=26, window_fast=12, window_sign=9)
+        df['macd'] = macd.macd()
+        df['volatility_20'] = df['close'].rolling(window=20).std()
+        
+        # Strategy loop
+        for strat_name, strat_info in STRATEGY_CONFIG.items():
+            try:
+                strat_class = strat_info['class']
+                strat_instance = strat_class()
+                df[f"sig_{strat_name}"] = strat_instance.get_signal_column(df)
+            except:
+                df[f"sig_{strat_name}"] = 0
+                
+        return df.iloc[-1:] # Return only the latest row
 
 # ==========================================
 if TESTNET_MODE:
@@ -107,170 +71,149 @@ else:
 if not KEY or not ADDR:
     raise ValueError(f"❌ MISSING CREDENTIALS! Mode is {TESTNET_MODE}, but keys not found in Env Vars.")
 
-# --- HANDLER 1: THE SOLDIER (Executor) ---
 def executor_handler(event, context):
-    logger.info(f"Received event: {event}")
-    task = event.get("task", "execute_trades")
+    logger.info(f"🚀 Waking up Live Engine...")
     info = Info(BASE_URL, skip_ws=True)
     
+    task = event.get("task", "execute_trades")
     if task == "send_daily_report":
-        logger.info("Generating daily Telegram receipt...")
-      
-        # Run the fetcher and formatter functions
         stats = fetch_daily_receipt(info, ADDR)
         msg = send_telegram_receipt(stats)
-        
-        # Use your existing Telegram helper!
         send_telegram_message(msg)
-        
         return {'statusCode': 200, 'body': 'Daily report sent'}
 
-    elif task == "execute_trades":
-        # 1. Load Orders & Intelligence
-        s3 = S3Interface(AWS_BUCKET)
-        risk = RiskEngine(bucket=AWS_BUCKET)
-        
-        # Load the Live Scout Intelligence (The Fused Ranking)
-        scout_data = s3.load_json("live_scout_intelligence.json")
-        if scout_data:
-            # The Scout's #1 pick is our new target
-            best_scout = scout_data[0]
-            target_coin = best_scout.get("target_coin", "BTC").split("/")[0]
-            target_tf = best_scout.get("timeframe", "15m")
-            target_strat = best_scout.get("strategy", "SimpleBreakout")
-            target_params = best_scout.get("params", {"n": 50})
-            target_conviction = best_scout.get("live_conviction", 1.0)
+    # 1. 🛡️ ACCOUNT SAFETY FIRST
+    account = Account.from_key(KEY)
+    exchange = Exchange(account, BASE_URL, account_address=ADDR)
+    risk = RiskEngine(exchange=exchange, info=info, account_address=ADDR, bucket=AWS_BUCKET)
+    
+    user_state = info.user_state(ADDR)
+    if not risk.check_safety(user_state): return {'statusCode': 400, 'body': 'Safety failed'}
+    
+    all_mids = info.all_mids()
+    portfolio = risk.parse_portfolio(user_state, all_mids)
+    open_orders = info.frontend_open_orders(ADDR)
+    
+    # Clean Zombies
+    risk.clean_global_zombies(portfolio, open_orders)
+
+    # 2. 🌐 THE LIVE SNAPSHOT
+    from data_pipeline.hyperliquid_sync import get_hl_top_by_volume, get_live_meta_ctx, get_latest_candles
+    
+    logger.info("📡 Pinging Hyperliquid for Top 100 assets & Live Meta Context...")
+    top_100_symbols = get_hl_top_by_volume(100)
+    live_ctx = get_live_meta_ctx()
+    
+    engine = LiveInferenceEngine(info)
+    live_rows = []
+    
+    # 3. 🧠 FEATURE GENERATION
+    logger.info("🧬 Generating Live Features (Klines + Strategies)...")
+    for sym in top_100_symbols:
+        candles = get_latest_candles(sym, interval='15m', limit=100)
+        ctx = live_ctx.get(sym, {})
+        row_df = engine.build_live_features(sym, candles, ctx)
+        if row_df is not None and not row_df.empty:
+            row_df['symbol'] = sym
             
-            logger.info(f"🛰️ BOT: Using Live Scout Intelligence for {target_coin} (Conviction: {target_conviction:.2%})")
+            # Need ATR for risk engine later
+            high, low = pd.Series([c['high'] for c in candles]), pd.Series([c['low'] for c in candles])
+            prev_close = pd.Series([c['close'] for c in candles]).shift(1)
+            tr = pd.concat([high - low, (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
+            atr_pct = (tr.rolling(14).mean() / pd.Series([c['close'] for c in candles])).iloc[-1]
+            row_df['atr_pct'] = atr_pct
+            
+            live_rows.append(row_df)
+            
+    if not live_rows:
+        logger.error("❌ Failed to build any live features.")
+        return
+        
+    mega_df = pd.concat(live_rows, ignore_index=True)
+    
+    # 4. 🥇 THE LIVE RANKING
+    logger.info("⚖️ Applying Cross-Sectional Ranking...")
+    continuous_features = ['rsi', 'macd', 'volatility_20', 'basis_pct', 'oi_zscore', 'funding_delta']
+    # If sum_toptrader_long_short_ratio is missing, fill 0
+    mega_df['sum_toptrader_long_short_ratio'] = 0 
+    continuous_features.append('sum_toptrader_long_short_ratio')
+    
+    for col in continuous_features:
+        mega_df[f'rank_{col}'] = mega_df[col].rank(pct=True)
+
+    # 5. 🤖 INFERENCE
+    s3 = S3Interface(AWS_BUCKET)
+    model_path = '/tmp/cross_sectional_lgbm.txt'
+    
+    logger.info("🧠 Downloading LightGBM model from S3...")
+    success = s3.download_file('models/cross_sectional_lgbm.txt', model_path)
+    
+    if success:
+        import lightgbm as lgb
+        model = lgb.Booster(model_file=model_path)
+        
+        feature_cols = ['rank_rsi', 'rank_macd', 'rank_volatility_20', 'rank_basis_pct', 'rank_oi_zscore', 'rank_funding_delta', 'rank_sum_toptrader_long_short_ratio']
+        strategy_cols = [col for col in mega_df.columns if col.startswith('sig_')]
+        X_live = mega_df[feature_cols + strategy_cols]
+        
+        mega_df['predicted_rank'] = model.predict(X_live)
+    else:
+        logger.warning("⚠️ Failed to load ML model. Falling back to simple Momentum Rank (RSI + MACD).")
+        mega_df['predicted_rank'] = (mega_df['rank_rsi'] + mega_df['rank_macd']) / 2
+
+    # 6. 🔪 SORT AND SLICE (Market Neutral Basket)
+    mega_df = mega_df.sort_values('predicted_rank', ascending=False)
+    
+    top_3 = mega_df.head(3)
+    bottom_3 = mega_df.tail(3)
+    
+    target_longs = top_3['symbol'].tolist()
+    target_shorts = bottom_3['symbol'].tolist()
+    
+    target_basket = target_longs + target_shorts
+    logger.info(f"🎯 TARGET LONGS: {target_longs}")
+    logger.info(f"🎯 TARGET SHORTS: {target_shorts}")
+    
+    # --- PHASE 5: MARKET-NEUTRAL EXECUTION ---
+    
+    # 1. PORTFOLIO RECONCILIATION
+    temp_assets = AssetManager(info)
+    for active_coin in list(portfolio.keys()):
+        # If open position is NOT in our new basket, KILL IT.
+        if active_coin not in target_basket:
+            logger.info(f"🧹 RECONCILIATION: {active_coin} dropped out of Top/Bottom 3. Closing position.")
+            send_telegram_message(f"🧹 RECONCILIATION: {active_coin} lost its edge. Closing.")
+            risk.close_active_position(active_coin, all_mids, temp_assets, portfolio, AWS_BUCKET)
+            
+    # Refresh state after closes
+    time.sleep(2)
+    user_state = info.user_state(ADDR)
+    portfolio = risk.parse_portfolio(user_state, all_mids)
+    open_orders = info.frontend_open_orders(ADDR)
+
+    # 2. MARKET-NEUTRAL ENTRY
+    for target_coin in target_basket:
+        row = mega_df[mega_df['symbol'] == target_coin].iloc[0]
+        signal = "BULLISH" if target_coin in target_longs else "BEARISH"
+        atr_pct = float(row['atr_pct'])
+        
+        if target_coin not in portfolio:
+            logger.info(f"🚀 BASKET ENTRY: {signal} {target_coin}")
+            risk.execute_logic(target_coin, signal, "15m", atr_pct, portfolio, user_state, open_orders)
         else:
-            # Standard Fallback to Weekly Blueprint
-            config = s3.load_json(CONFIG_FILE)
-            target_coin = config.get("target_coin", "BTC").split("/")[0]
-            target_tf = config.get("timeframe", "15m")
-            target_strat = config.get("strategy", "SimpleBreakout")
-            target_params = config.get("params", {"n": 50})
-            target_conviction = 1.0
-            logger.warning("🛰️ BOT: No Scout data found. Falling back to Weekly Blueprint.")
-
-        user_state = info.user_state(ADDR)
-        all_mids = info.all_mids()
-        
-        account = Account.from_key(KEY)
-        exchange = Exchange(account, BASE_URL, account_address=ADDR)
-        
-        # Attach dependencies to risk before use
-        risk.exchange = exchange
-        risk.info = info
-        
-        portfolio = risk.parse_portfolio(user_state, all_mids)
-        temp_assets = AssetManager(info)
-        needs_state_refresh = False
-        
-        if target_coin == "SLEEP":
-            logger.warning("💤 MARKET SLEEP MODE ACTIVATED.")
-
-            for coin, pos_data in portfolio.items():
-                sz = float(pos_data['szi'])
-                
-                logger.info(f"🧹 FLUSHING: Closing {coin} position due to Market Sleep.")
-                send_telegram_message(f"🧹 FLUSHING: Closing {coin} to preserve capital (Market Toxic).")
-                
-                try: risk.cancel_all_orders(coin)
-                except: pass
-                
-                # IOC IOC
-                is_buy = sz < 0
-                slippage = 0.002
-                raw_price = float(all_mids[coin])
-                curr_px = temp_assets.get_price_precision(coin, raw_price)
-                
-                raw_limit_px = curr_px * (1 + slippage) if is_buy else curr_px * (1 - slippage)
-                limit_px = temp_assets.get_price_precision(coin, raw_limit_px)
-                
-                exchange.order(coin, is_buy, abs(sz), limit_px, {"limit": {"tif": "Ioc"}}, reduce_only=True)
-                
-                StateManager(AWS_BUCKET).clear(coin)
-                    
-            return {'statusCode': 200, 'body': json.dumps('Sleep Mode - Positions Flushed')}
-
-        # 2. Check for "Regime Change" (Switching Coins)        
-        active_coin = next(iter(portfolio), None)
-        if active_coin:
-            pass # logger.info(f"🎯 FOUND REAL POSITION: {active_coin}")
-                    
-        # 3. CONFLICT RESOLUTION (Dynamic Opportunity Cost) ⚖️
-        if active_coin and active_coin != target_coin:
+            # We already have it. Just sync Breakeven logic.
+            risk.sync_break_even(target_coin, atr_pct, portfolio, open_orders)
             
-            market_scan = s3.load_json(LEADERBOARD_FILE)
-            
-            current_holding_score = -999 
-            new_target_score = -999
-            
-            if market_scan and active_coin in market_scan:
-                current_holding_score = market_scan[active_coin].get('score', -999)
-            
-            if market_scan and target_coin in market_scan:
-                new_target_score = market_scan[target_coin].get('score', -999)
-            
-            SCORE_SWITCH_THRESHOLD = 1.15
-            should_swap = False
+    # 3. THE SHIELD
+    # Refresh one last time to ensure we have the new positions
+    time.sleep(2)
+    portfolio = risk.parse_portfolio(info.user_state(ADDR), all_mids)
+    for active_coin in portfolio:
+        row = mega_df[mega_df['symbol'] == active_coin]
+        if not row.empty:
+            atr_pct = float(row.iloc[0]['atr_pct'])
+            # Place Unified TP/SL
+            risk.sync_unified_orders(active_coin, atr_pct, portfolio)
 
-            if current_holding_score <= 0:
-                logger.info(f"🚨 BAILOUT: Current score is {current_holding_score:.2f}. Instant swap to target!")
-                should_swap = True
-                
-            else: 
-                score_ratio = new_target_score / current_holding_score 
-                logger.info(f"⚖️ COMPARISON: Holding {active_coin} (Score: {current_holding_score:.2f}) vs Target {target_coin} (Score: {new_target_score:.2f}) | Ratio: {score_ratio:.2f}")
-
-                if score_ratio > SCORE_SWITCH_THRESHOLD:
-                    logger.info(f"🔄 SWAP APPROVED: Target is {((score_ratio - 1) * 100):.1f}% better. Executing swap.")
-                    should_swap = True
-                else:
-                    logger.info(f"🧲 STICKY HOLD: {active_coin} is still good enough.")
-
-            if should_swap:
-                success = risk.close_active_position(
-                    active_coin=active_coin, 
-                    all_mids=all_mids, 
-                    temp_assets=temp_assets,
-                    portfolio=portfolio, 
-                    aws_bucket=AWS_BUCKET
-                )
-                
-                if success:
-                    needs_state_refresh = True
-                else:
-                    # Brain cancels the swap
-                    should_swap = False
-
-            if not should_swap:
-                target_coin = active_coin
-                
-                if market_scan and active_coin in market_scan:
-                    target_strat = market_scan[active_coin]['strategy']
-                    target_params = market_scan[active_coin]['params']
-                    target_tf = market_scan[active_coin]['timeframe']
-
-        if needs_state_refresh:
-            user_state = info.user_state(ADDR)
-            portfolio = risk.parse_portfolio(user_state, all_mids)
-
-        # 4. EXECUTE NEW ORDERS (Only if no legacy position blocks us)
-        if target_strat in STRATEGY_CONFIG:
-            strat_class = STRATEGY_CONFIG[target_strat]["class"]
-            chosen_strat = strat_class(**target_params)
-        else:
-            chosen_strat = SimpleBreakout(n=50)
-
-        # 5. CONVICTION BAILOUT
-        # If the target is SLEEP or conviction is too low, we stop
-        if target_conviction < 0.30: # 30% conviction floor
-             logger.warning(f"📉 BAILOUT: AI Conviction for {target_coin} too low ({target_conviction:.2%}). Staying flat.")
-             # Add logic to close existing pos if target_coin matches active_coin
-             return
-
-        bot = HyperliquidBot(exchange, info, target_coin, target_tf, AWS_BUCKET, chosen_strat, risk)
-        bot.run_tick(portfolio, user_state)
-        
-        return {'statusCode': 200, 'body': json.dumps('Executed')}
+    logger.info("✅ Live Engine Cycle Complete.")
+    return {'statusCode': 200, 'body': json.dumps('Basket Executed')}

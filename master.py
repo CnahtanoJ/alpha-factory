@@ -97,10 +97,12 @@ def cmd_ingest(args):
     timeframes = [t.strip() for t in args.timeframe.split(',')]
     
     if args.top:
-        # Auto-discover top symbols by volume
-        from data_pipeline.data_fetcher import get_top_symbols_by_volume
-        print(f"\n🔍 Discovering top {args.top} symbols by volume...")
-        symbols = get_top_symbols_by_volume(sync.exchange, limit=args.top)
+        # Auto-discover top symbols by volume from Hyperliquid
+        from data_pipeline.hyperliquid_sync import get_hl_top_by_volume
+        print(f"\n🔍 Discovering top {args.top} HL symbols by volume...")
+        hl_symbols = get_hl_top_by_volume(limit=args.top)
+        # Map HL symbol to Binance symbol format
+        symbols = [f"{s}/USDT" for s in hl_symbols]
         print(f"   Found: {symbols[:5]}... ({len(symbols)} total)")
     else:
         symbols = [s.strip() for s in args.symbols.split(',')]

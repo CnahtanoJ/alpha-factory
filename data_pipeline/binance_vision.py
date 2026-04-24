@@ -27,6 +27,9 @@ class BinanceVision:
                 'count_long_short_ratio', 'sum_long_short_ratio',
                 'count_taker_long_short_vol_ratio', 'sum_taker_long_short_vol_ratio',
                 'timestamp'
+            ],
+            'fundingRate': [
+                'calc_time', 'funding_interval_hours', 'last_funding_rate'
             ]
         }
 
@@ -41,6 +44,11 @@ class BinanceVision:
             else:
                 month_str = f"{month:02d}"
                 return f"{self.base_url}/monthly/metrics/{clean_symbol}/{clean_symbol}-metrics-{year}-{month_str}.zip"
+                
+        # FundingRate is monthly only and has no timeframe parameter
+        if data_type == 'fundingRate':
+            month_str = f"{month:02d}"
+            return f"{self.base_url}/monthly/fundingRate/{clean_symbol}/{clean_symbol}-fundingRate-{year}-{month_str}.zip"
         
         # For klines and indexPriceKlines
         if daily_date:
@@ -69,7 +77,7 @@ class BinanceVision:
             df.columns = expected_cols[:len(df.columns)]
             
             # Convert timestamp columns to numeric
-            ts_cols = ['timestamp', 'create_time']
+            ts_cols = ['timestamp', 'create_time', 'calc_time']
             for col in ts_cols:
                 if col in df.columns:
                     df[col] = pd.to_numeric(df[col], errors='coerce')
@@ -98,8 +106,8 @@ class BinanceVision:
                     all_dfs.append(df)
                     print(f"  Collected Monthly {data_type}: {year}-{month:02d}")
                 else:
-                    # Daily fallback for current/last year
-                    if year >= now.year - 1:
+                    # Daily fallback for current/last year (not for fundingRate which is monthly only)
+                    if year >= now.year - 1 and data_type != 'fundingRate':
                         print(f"  Monthly missing for {year}-{month:02d}. Trying Daily...")
                         for day in range(1, 32):
                             try:
@@ -119,7 +127,9 @@ class BinanceVision:
             return pd.DataFrame()
             
         # Standardize on 'timestamp' for sorting and dedup
-        sort_col = 'timestamp' if 'timestamp' in all_dfs[0].columns else 'create_time'
+        sort_col = 'timestamp' 
+        if 'timestamp' not in all_dfs[0].columns:
+            sort_col = 'calc_time' if 'calc_time' in all_dfs[0].columns else 'create_time'
         
         return pd.concat(all_dfs).drop_duplicates(subset=[sort_col]).sort_values(sort_col)
 

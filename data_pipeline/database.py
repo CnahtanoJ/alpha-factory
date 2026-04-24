@@ -67,6 +67,17 @@ def init_db():
         )
     ''')
 
+    # Funding Rate Table
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS funding_rate (
+            calc_time INTEGER,
+            symbol TEXT,
+            funding_interval_hours INTEGER,
+            last_funding_rate REAL,
+            PRIMARY KEY (symbol, calc_time)
+        )
+    ''')
+
     # Sync State Table - Tracks progress for smart resuming
     conn.execute('''
         CREATE TABLE IF NOT EXISTS sync_state (

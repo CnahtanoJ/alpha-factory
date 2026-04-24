@@ -23,6 +23,15 @@ class S3Interface:
             self.s3.put_object(Bucket=self.bucket, Key=filename, Body=json.dumps(data, indent=4))
         except Exception as e: logger.error(f"S3 Save Error: {e}")
 
+    def download_file(self, s3_key, local_path):
+        """Downloads a raw file (like a .txt model) from S3 to local disk."""
+        try:
+            self.s3.download_file(self.bucket, s3_key, local_path)
+            return True
+        except Exception as e:
+            logger.error(f"S3 Download Error for {s3_key}: {e}")
+            return False
+
 def is_authorized(chat_id):
     """
     The Gatekeeper: Verifies if a chat_id is the owner designated in .env.

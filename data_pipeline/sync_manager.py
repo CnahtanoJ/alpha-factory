@@ -22,34 +22,34 @@ class SyncManager:
         self.exchange = get_exchange(exchange_id)
         self.conn = get_connection()
         
-    def get_sync_state(self, symbol, timeframe, market):
+    def get_sync_state(self, symbol, timeframe, market, data_type='klines'):
         cursor = self.conn.execute(
-            "SELECT earliest_timestamp, latest_timestamp FROM sync_state WHERE symbol = ? AND timeframe = ? AND market = ?",
-            (symbol, timeframe, market)
+            "SELECT earliest_timestamp, latest_timestamp FROM sync_state WHERE symbol = ? AND timeframe = ? AND market = ? AND data_type = ?",
+            (symbol, timeframe, market, data_type)
         )
         row = cursor.fetchone()
         if row:
             return row['earliest_timestamp'], row['latest_timestamp']
         return None, None
 
-    def update_sync_state(self, symbol, timeframe, market, earliest, latest):
+    def update_sync_state(self, symbol, timeframe, market, data_type, earliest, latest):
         self.conn.execute(
-            "INSERT OR REPLACE INTO sync_state (symbol, timeframe, market, earliest_timestamp, latest_timestamp) VALUES (?, ?, ?, ?, ?)",
-            (symbol, timeframe, market, earliest, latest)
+            "INSERT OR REPLACE INTO sync_state (symbol, timeframe, market, data_type, earliest_timestamp, latest_timestamp) VALUES (?, ?, ?, ?, ?, ?)",
+            (symbol, timeframe, market, data_type, earliest, latest)
         )
         self.conn.commit()
 
-    def sync_from_binance_vision(self, symbol, timeframe='1h', market='futures', start_year=2020):
+    def sync_from_binance_vision(self, symbol, timeframe='1h', market='futures', start_year=2020, data_type='klines'):
         """
         Downloads bulk historical data from Binance Vision (free public CSVs).
         This is the primary method for deep historical backfills.
         """
-        print(f"📦 Downloading {symbol} ({timeframe}) [{market}] from Binance Vision...")
+        print(f"📦 Downloading {symbol} ({timeframe}) [{market}] {data_type} from Binance Vision...")
         use_spot = (market == 'spot')
         vision = BinanceVision(use_spot=use_spot)
         
         # Check if we already have some data (smart resume)
-        earliest, latest = self.get_sync_state(symbol, timeframe, market)
+        earliest, latest = self.get_sync_state(symbol, timeframe, market, data_type)
         effective_start_year = start_year
         effective_start_month = 1
         
@@ -72,11 +72,12 @@ class SyncManager:
         df = vision.fetch_history_range(
             binance_symbol, timeframe, 
             start_year=effective_start_year, 
-            start_month=effective_start_month
+            start_month=effective_start_month,
+            data_type=data_type
         )
         
         if df.empty:
-            print(f"  ⚠️ No data found on Binance Vision for {symbol}.")
+            print(f"  ⚠️ No data found on Binance Vision for {symbol} ({data_type}).")
             return 0
         
         # Valid range: 2017-01-01 to 2027-01-01
@@ -86,41 +87,76 @@ class SyncManager:
         # Bulk insert to SQLite, aggressively filtering bad timestamps
         insert_data = []
         for _, row in df.iterrows():
-            ts = int(row['timestamp'])
+            ts = int(row.get('timestamp') or row.get('calc_time') or row.get('create_time'))
             
             # Normalize 16-digit microseconds to 13-digit milliseconds
             if ts > 9999999999999:
                 ts = ts // 1000
                 
             if valid_min_ms <= ts <= valid_max_ms:
-                insert_data.append(
-                    (ts, symbol, timeframe, market,
-                     float(row['open']), float(row['high']),
-                     float(row['low']), float(row['close']), float(row['volume']))
-                )
+                if data_type == 'klines':
+                    insert_data.append(
+                        (ts, symbol, timeframe, market,
+                         float(row['open']), float(row['high']),
+                         float(row['low']), float(row['close']), float(row['volume']))
+                    )
+                elif data_type == 'indexPriceKlines':
+                    insert_data.append(
+                        (ts, symbol, timeframe,
+                         float(row['open']), float(row['high']),
+                         float(row['low']), float(row['close']))
+                    )
+                elif data_type == 'metrics':
+                    insert_data.append(
+                        (ts, int(row['create_time']), symbol,
+                         float(row['sum_open_interest']), float(row['sum_open_interest_value']),
+                         float(row['count_toptrader_long_short_ratio']), float(row['sum_toptrader_long_short_ratio']),
+                         float(row['count_long_short_ratio']), float(row['sum_long_short_ratio']),
+                         float(row['count_taker_long_short_vol_ratio']), float(row['sum_taker_long_short_vol_ratio']))
+                    )
+                elif data_type == 'fundingRate':
+                    insert_data.append(
+                        (ts, symbol, int(row['funding_interval_hours']), float(row['last_funding_rate']))
+                    )
         
         if not insert_data:
             print(f"  ⚠️ No valid timestamps found in {symbol} Binance Vision data.")
             return 0
         
-        self.conn.executemany(
-            "INSERT OR REPLACE INTO ohlcv (timestamp, symbol, timeframe, market, open, high, low, close, volume) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            insert_data
-        )
+        if data_type == 'klines':
+            self.conn.executemany(
+                "INSERT OR REPLACE INTO ohlcv (timestamp, symbol, timeframe, market, open, high, low, close, volume) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                insert_data
+            )
+        elif data_type == 'indexPriceKlines':
+            self.conn.executemany(
+                "INSERT OR REPLACE INTO index_ohlcv (timestamp, symbol, timeframe, open, high, low, close) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                insert_data
+            )
+        elif data_type == 'metrics':
+            self.conn.executemany(
+                "INSERT OR REPLACE INTO symbol_metrics (timestamp, create_time, symbol, sum_open_interest, sum_open_interest_value, count_toptrader_long_short_ratio, sum_toptrader_long_short_ratio, count_long_short_ratio, sum_long_short_ratio, count_taker_long_short_vol_ratio, sum_taker_long_short_vol_ratio) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                insert_data
+            )
+        elif data_type == 'fundingRate':
+            self.conn.executemany(
+                "INSERT OR REPLACE INTO funding_rate (calc_time, symbol, funding_interval_hours, last_funding_rate) VALUES (?, ?, ?, ?)",
+                insert_data
+            )
         
         # Update sync state based ONLY on the valid, filtered inserted data
         valid_timestamps = [x[0] for x in insert_data]
         new_earliest = min(valid_timestamps)
         new_latest = max(valid_timestamps)
         
-        cur_earliest, cur_latest = self.get_sync_state(symbol, timeframe, market)
+        cur_earliest, cur_latest = self.get_sync_state(symbol, timeframe, market, data_type)
         final_earliest = min(new_earliest, cur_earliest) if cur_earliest else new_earliest
         final_latest = max(new_latest, cur_latest) if cur_latest else new_latest
         
-        self.update_sync_state(symbol, timeframe, market, final_earliest, final_latest)
+        self.update_sync_state(symbol, timeframe, market, data_type, final_earliest, final_latest)
         self.conn.commit()
         
-        print(f"  ✅ Synced {len(insert_data)} rows from Binance Vision.")
+        print(f"  ✅ Synced {len(insert_data)} rows of {data_type} from Binance Vision.")
         return len(insert_data)
 
     def sync_from_exchange(self, symbol, timeframe='1h', market='futures', target_years=3):
@@ -170,7 +206,7 @@ class SyncManager:
                     
                     # Update state
                     new_latest = max(new_data, key=lambda x: x[0])[0]
-                    self.update_sync_state(symbol, timeframe, market, earliest, new_latest)
+                    self.update_sync_state(symbol, timeframe, market, 'klines', earliest, new_latest)
                     latest = new_latest
                     current_forward = new_latest
                     total_synced += len(new_data)
@@ -218,7 +254,7 @@ class SyncManager:
                 if not latest:
                     latest = max(new_data, key=lambda x: x[0])[0]
                 
-                self.update_sync_state(symbol, timeframe, market, earliest, latest)
+                self.update_sync_state(symbol, timeframe, market, 'klines', earliest, latest)
                 current_since = earliest
                 total_synced += len(new_data)
                 
@@ -250,7 +286,11 @@ class SyncManager:
         print(f"{'='*60}")
         
         # Step 1: Binance Vision (bulk historical)
-        self.sync_from_binance_vision(symbol, timeframe, market, start_year)
+        self.sync_from_binance_vision(symbol, timeframe, market, start_year, data_type='klines')
+        if market == 'futures':
+            self.sync_from_binance_vision(symbol, timeframe, market, start_year, data_type='indexPriceKlines')
+            self.sync_from_binance_vision(symbol, timeframe, market, start_year, data_type='metrics')
+            self.sync_from_binance_vision(symbol, timeframe, market, start_year, data_type='fundingRate')
         
         # Step 2: Exchange API (gap fill)
         self.sync_from_exchange(symbol, timeframe, market, target_years)
