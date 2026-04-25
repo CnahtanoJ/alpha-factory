@@ -45,8 +45,7 @@ class SyncManager:
         This is the primary method for deep historical backfills.
         """
         print(f"📦 Downloading {symbol} ({timeframe}) [{market}] {data_type} from Binance Vision...")
-        use_spot = (market == 'spot')
-        vision = BinanceVision(use_spot=use_spot)
+        vision = BinanceVision()
         
         # Check if we already have some data (smart resume)
         earliest, latest = self.get_sync_state(symbol, timeframe, market, data_type)
@@ -166,7 +165,7 @@ class SyncManager:
         """
         print(f"🔄 Gap-filling {symbol} ({timeframe}) [{market}] from exchange API...")
         
-        self.exchange.options['defaultType'] = 'spot' if market == 'spot' else 'future'
+        self.exchange.options['defaultType'] = 'future'
         
         target_delta = timedelta(days=target_years * 365)
         now_ms = int(datetime.now().timestamp() * 1000)
@@ -275,25 +274,27 @@ class SyncManager:
         
         return total_synced
 
-    def sync_symbol(self, symbol, timeframe='1h', market='futures', target_years=3, start_year=2020):
+    def sync_symbol(self, symbol, timeframe='1h', market='futures', target_years=3, start_year=2020, skip_exchange=False):
         """
         Full sync for a single symbol:
           1. Bulk download from Binance Vision (free, fast)
-          2. Fill remaining gaps from exchange API
+          2. Fill remaining gaps from exchange API (unless skip_exchange=True)
         """
         print(f"\n{'='*60}")
         print(f"  Syncing: {symbol} | {timeframe} | {market}")
         print(f"{'='*60}")
         
-        # Step 1: Binance Vision (bulk historical)
+        # Step 1: Binance Vision (bulk historical) — always fetches all data types for futures
         self.sync_from_binance_vision(symbol, timeframe, market, start_year, data_type='klines')
-        if market == 'futures':
-            self.sync_from_binance_vision(symbol, timeframe, market, start_year, data_type='indexPriceKlines')
-            self.sync_from_binance_vision(symbol, timeframe, market, start_year, data_type='metrics')
-            self.sync_from_binance_vision(symbol, timeframe, market, start_year, data_type='fundingRate')
+        self.sync_from_binance_vision(symbol, timeframe, market, start_year, data_type='indexPriceKlines')
+        self.sync_from_binance_vision(symbol, timeframe, market, start_year, data_type='metrics')
+        self.sync_from_binance_vision(symbol, timeframe, market, start_year, data_type='fundingRate')
         
         # Step 2: Exchange API (gap fill)
-        self.sync_from_exchange(symbol, timeframe, market, target_years)
+        if not skip_exchange:
+            self.sync_from_exchange(symbol, timeframe, market, target_years)
+        else:
+            print("  ⏭️ Skipping CCXT gap-fill (--no-gap-fill mode).")
         
         # Summary
         earliest, latest = self.get_sync_state(symbol, timeframe, market)
@@ -314,11 +315,11 @@ class SyncManager:
             count = cursor.fetchone()['cnt']
             print(f"  📊 Total: {count:,} candles from {start} to {end}")
 
-    def bulk_sync(self, symbols, timeframe='1h', market='futures', target_years=3, start_year=2020):
+    def bulk_sync(self, symbols, timeframe='1h', market='futures', target_years=3, start_year=2020, skip_exchange=False):
         """Syncs multiple symbols sequentially."""
         for i, symbol in enumerate(symbols):
             print(f"\n[{i+1}/{len(symbols)}] ", end="")
-            self.sync_symbol(symbol, timeframe, market, target_years, start_year)
+            self.sync_symbol(symbol, timeframe, market, target_years, start_year, skip_exchange=skip_exchange)
 
     def close(self):
         self.conn.close()

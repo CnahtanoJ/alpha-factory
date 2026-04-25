@@ -6,8 +6,8 @@ import time
 from datetime import datetime, timedelta
 
 class BinanceVision:
-    def __init__(self, use_spot=False):
-        self.market_type = "spot" if use_spot else "futures/um"
+    def __init__(self):
+        self.market_type = "futures/um"
         self.base_url = f"https://data.binance.vision/data/{self.market_type}"
         
         # Column Definitions

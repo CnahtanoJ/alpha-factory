@@ -20,106 +20,102 @@ def get_hyperliquid_universe(testnet=False):
 
 def get_hl_symbol_map(testnet=False):
     """
-    Builds a lookup table mapping (human_symbol, market) 
-    to HL API strings (BTC, @107).
+    Builds a lookup table mapping canonical symbol names
+    to HL API strings for perpetual futures.
     """
     url = constants.TESTNET_API_URL if testnet else constants.MAINNET_API_URL
     info = Info(url, skip_ws=True)
     
-    symbol_map = {} # (Canonical, Market) -> HL_String
+    symbol_map = {}
     
     try:
-        # 1. Map Perps (Futures)
         meta = info.meta()
         for asset in meta['universe']:
             if not asset.get('isDelisted', False):
                 name = asset['name']
                 canonical = f"{name}/USDT"
-                symbol_map[(canonical, 'futures')] = name
-        
-        # 2. Map Spot (Dynamic Discovery)
-        sm = info.spot_meta()
-        all_spot_tokens = {t['name'] for t in sm['tokens']}
-        tokens_by_index = {t['index']: t['name'] for t in sm['tokens']}
-        
-        for idx, pair in enumerate(sm['universe']):
-            api_name = pair['name'] # e.g. "PURR/USDC" or "@1"
-            pair_index = pair['index']
-            base_token_idx = pair['tokens'][0]
-            base_l1_name = tokens_by_index.get(base_token_idx, "UNKNOWN")
-            
-            # Discovery Logic: Map human names to L1 names
-            # If the exchange uses 'UBTC' but we want 'BTC', we check if 'UBTC' is the L1 name.
-            # We look for:
-            #   - Direct match (HYPE -> HYPE)
-            #   - Unified match (BTC -> UBTC)
-            #   - Purr match (PURR -> PURR)
-            
-            human_name = base_l1_name
-            if base_l1_name.startswith('U') and len(base_l1_name) > 1:
-                potential_human = base_l1_name[1:] # e.g. UBTC -> BTC
-                # If the human name exists in Perps (like BTC), it's a valid remapping
-                if any(asset['name'] == potential_human for asset in meta['universe']):
-                    human_name = potential_human
-
-            canonical = f"{human_name}/USDT"
-            api_string = api_name if "/" in api_name else f"@{pair_index}"
-            symbol_map[(canonical, 'spot')] = api_string
+                symbol_map[canonical] = name
 
         return symbol_map
     except Exception as e:
         print(f"Error building HL symbol map: {e}")
         return {}
 
-def get_latest_candles(symbol, interval='1h', limit=100, testnet=False, hl_map=None, market='futures'):
+def get_latest_candles(symbol, interval='1h', limit=100, testnet=False):
     """
-    Fetches the latest OHLCV candles from Hyperliquid REST API.
-    Handles the @index mapping for spot and direct names for perps.
+    Fetches the latest OHLCV candles from Hyperliquid REST API (perpetual futures).
+    Symbol can be either 'BTC' or 'BTC/USDT' format.
     """
-    if hl_map is None:
-        hl_map = get_hl_symbol_map(testnet)
-        
-    hl_api_string = hl_map.get((symbol, market))
-    if not hl_api_string:
-        # Fallback for common perps if market is unspecified or missing
-        if market == 'futures':
-             hl_api_string = symbol.split('/')[0]
-        else:
-            return []
+    # Normalize: accept both 'BTC' and 'BTC/USDT'
+    hl_api_string = symbol.split('/')[0]
     
     url = constants.TESTNET_API_URL if testnet else constants.MAINNET_API_URL
     info = Info(url, skip_ws=True)
     
-    # HL expects timestamps in ms. Get approximately 'limit' candles back.
-    # The API finds candles that END before or at the endTime.
+    # HL expects timestamps in ms
     end_time = int(time.time() * 1000)
     
-    try:
-        # candle_snapshot returns a list of candles. NOTE: Typo fixed from 'candle_snapshot'
-        candles = info.candles_snapshot(hl_api_string, interval, 0, end_time)
-        if not candles: return []
+    for attempt in range(3):
+        try:
+            candles = info.candles_snapshot(hl_api_string, interval, 0, end_time)
+            if candles:
+                # Take the most recent 'limit'
+                latest = candles[-limit:]
+                
+                formatted = []
+                for c in latest:
+                    formatted.append({
+                        'timestamp': c['t'],
+                        'open': float(c['o']),
+                        'high': float(c['h']),
+                        'low': float(c['l']),
+                        'close': float(c['c']),
+                        'volume': float(c['v']),
+                        'symbol': symbol,
+                        'timeframe': interval,
+                        'market': 'futures'
+                    })
+                return formatted
+            
+            # If empty, sleep and retry
+            time.sleep(1.0 * (2 ** attempt))
+            
+        except Exception as e:
+            print(f"Error fetching HL candles for {symbol} ({hl_api_string}) [Attempt {attempt+1}]: {e}")
+            time.sleep(1.0 * (2 ** attempt))
+            
+    return []
+
+def get_bulk_latest_candles(symbols, interval='15m', limit=100, testnet=False, batch_size=10, delay=0.5):
+    """
+    Fetches candles for multiple symbols concurrently in batches.
+    Significantly faster than sequential fetching while respecting rate limits.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+    
+    results = {}
+    
+    def fetch_single(sym):
+        return sym, get_latest_candles(sym, interval, limit, testnet)
+
+    for i in range(0, len(symbols), batch_size):
+        batch = symbols[i:i+batch_size]
         
-        # Take the most recent 'limit'
-        latest = candles[-limit:]
-        
-        # Format for our DB: timestamp, open, high, low, close, volume, symbol, timeframe, market
-        formatted = []
-        for c in latest:
-            formatted.append({
-                'timestamp': c['t'], # Opening time
-                'open': float(c['o']),
-                'high': float(c['h']),
-                'low': float(c['l']),
-                'close': float(c['c']),
-                'volume': float(c['v']),
-                'symbol': symbol,      # Preserve canonical symbol (slash format)
-                'timeframe': interval,
-                'market': market        # Preserve explicit market
-            })
-        return formatted
-    except Exception as e:
-        print(f"Error fetching HL candles for {symbol} ({hl_api_string}): {e}")
-        return []
+        with ThreadPoolExecutor(max_workers=batch_size) as executor:
+            futures = [executor.submit(fetch_single, sym) for sym in batch]
+            for future in futures:
+                try:
+                    sym, candles = future.result()
+                    if candles:
+                        results[sym] = candles
+                except Exception as e:
+                    print(f"Bulk fetch error for {sym}: {e}")
+                    
+        # Rate limiting pause between batches
+        if i + batch_size < len(symbols):
+            time.sleep(delay)
+            
+    return results
 
 def get_hl_top_by_volume(limit=100):
     """

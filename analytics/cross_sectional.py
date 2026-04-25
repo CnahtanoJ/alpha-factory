@@ -10,7 +10,8 @@ from ta.volatility import BollingerBands
 from ta.momentum import RSIIndicator
 from ta.trend import EMAIndicator, MACD
 import pickle
-
+import json
+from scipy.stats import spearmanr
 def fetch_and_merge_symbol_data(symbol, conn):
     """
     Fetches ohlcv, index_ohlcv, symbol_metrics, and funding_rate for a single symbol
@@ -51,7 +52,7 @@ def fetch_and_merge_symbol_data(symbol, conn):
     df['symbol'] = symbol
     return df
 
-def add_time_series_features(df):
+def add_time_series_features(df, btc_df=None):
     """
     Adds indicators, derivative fuel, and strategy signals to a single symbol's DataFrame.
     """
@@ -68,6 +69,22 @@ def add_time_series_features(df):
     df['basis_pct'] = (df['close'] - df['index_close']) / df['index_close']
     df['oi_zscore'] = (df['sum_open_interest'] - df['sum_open_interest'].rolling(50).mean()) / df['sum_open_interest'].rolling(50).std()
     df['funding_delta'] = df['last_funding_rate'].diff()
+    
+    # Market Correlation (Fixed to use BTC like Phase 2)
+    if btc_df is not None and not btc_df.empty:
+        df = pd.merge_asof(df, btc_df, on='timestamp', direction='backward')
+        df['corr_to_index'] = df['close'].pct_change().rolling(20).corr(df['btc_close'].pct_change())
+    else:
+        df['corr_to_index'] = 0
+    
+    # Cyclic Time Features
+    df['hour'] = df['timestamp'].dt.hour
+    df['hour_sin'] = np.sin(2 * np.pi * df['hour'] / 23)
+    df['hour_cos'] = np.cos(2 * np.pi * df['hour'] / 23)
+    df['day_of_week_num'] = df['timestamp'].dt.dayofweek
+    df['day_sin'] = np.sin(2 * np.pi * df['day_of_week_num'] / 6)
+    df['day_cos'] = np.cos(2 * np.pi * df['day_of_week_num'] / 6)
+
     
     # Forward Return (Target Calculation)
     df['fwd_return'] = df['close'].shift(-6) / df['close'] - 1
@@ -95,12 +112,17 @@ def build_mega_dataframe():
     conn = sqlite3.connect(DB_PATH)
     symbols = pd.read_sql_query("SELECT DISTINCT symbol FROM ohlcv", conn)['symbol'].tolist()
     
+    # Pre-fetch BTC data to use as the true "Market Index" for correlation (aligns with Phase 2)
+    btc_df = pd.read_sql_query("SELECT timestamp, close as btc_close FROM ohlcv WHERE symbol IN ('BTC/USDT', 'BTCUSDT', 'BTC') ORDER BY timestamp", conn)
+    if not btc_df.empty:
+        btc_df['timestamp'] = pd.to_datetime(btc_df['timestamp'], unit='ms')
+    
     all_dfs = []
     print(f"Building Mega-DataFrame for {len(symbols)} symbols...")
     for sym in symbols:
         df = fetch_and_merge_symbol_data(sym, conn)
         if df.empty: continue
-        df = add_time_series_features(df)
+        df = add_time_series_features(df, btc_df)
         all_dfs.append(df)
         
     conn.close()
@@ -115,7 +137,7 @@ def build_mega_dataframe():
     print("Applying cross-sectional ranking...")
     
     # Columns to rank
-    continuous_features = ['rsi', 'macd', 'volatility_20', 'basis_pct', 'oi_zscore', 'funding_delta', 'sum_toptrader_long_short_ratio']
+    continuous_features = ['rsi', 'macd', 'volatility_20', 'basis_pct', 'oi_zscore', 'funding_delta', 'sum_toptrader_long_short_ratio', 'corr_to_index']
     
     for col in continuous_features:
         mega_df[f'rank_{col}'] = mega_df.groupby('timestamp')[col].rank(pct=True)
@@ -138,12 +160,13 @@ def train_cross_sectional_lgbm(mega_df):
     mega_df = mega_df.sort_values('timestamp')
     
     # Define features
-    continuous_features = ['rank_rsi', 'rank_macd', 'rank_volatility_20', 'rank_basis_pct', 'rank_oi_zscore', 'rank_funding_delta', 'rank_sum_toptrader_long_short_ratio']
+    continuous_features = ['rank_rsi', 'rank_macd', 'rank_volatility_20', 'rank_basis_pct', 'rank_oi_zscore', 'rank_funding_delta', 'rank_sum_toptrader_long_short_ratio', 'rank_corr_to_index']
+    time_features = ['hour_sin', 'hour_cos', 'day_sin', 'day_cos']
     
     # Extract strategy signal columns dynamically
     strategy_features = [col for col in mega_df.columns if col.startswith('sig_')]
     
-    features = continuous_features + strategy_features
+    features = continuous_features + time_features + strategy_features
     
     X = mega_df[features]
     y = mega_df['target_rank']
@@ -184,28 +207,53 @@ def train_cross_sectional_lgbm(mega_df):
     
     print(f"Best Validation RMSE: {model.best_score['valid']['rmse']:.4f}")
     
+    # Calculate Spearman Correlation for Validation Set
+    val_preds = model.predict(X_val)
+    spearman_corr, p_value = spearmanr(val_preds, y_val)
+    print(f"Validation Spearman Correlation: {spearman_corr:.4f} (p-value: {p_value:.4f})")
+    
     # Save Model Locally
+    import datetime
+    timestamp_str = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d_%H%M%S")
     model_dir = os.path.join(os.path.dirname(__file__), 'models')
     os.makedirs(model_dir, exist_ok=True)
     model_path = os.path.join(model_dir, 'cross_sectional_lgbm.txt')
+    meta_path = os.path.join(model_dir, 'cross_sectional_lgbm_meta.json')
+    
+    versioned_model_path = os.path.join(model_dir, f'cross_sectional_lgbm_{timestamp_str}.txt')
+    
     model.save_model(model_path)
-    print(f"Model saved locally to {model_path}")
+    model.save_model(versioned_model_path)
+    print(f"Model saved locally to {model_path} and {versioned_model_path}")
+    
+    with open(meta_path, 'w') as f:
+        json.dump({
+            'validation_rmse': float(model.best_score['valid']['rmse']),
+            'validation_spearman_correlation': float(spearman_corr),
+            'spearman_p_value': float(p_value),
+            'timestamp': timestamp_str
+        }, f, indent=4)
+    print(f"Metadata saved locally to {meta_path}")
     
     # S3 Export
     try:
-        from bot.utils import S3Interface
+        import boto3
         from bot.config import AWS_BUCKET
-        s3 = S3Interface(AWS_BUCKET)
+        s3_client = boto3.client('s3')
         
-        with open(model_path, 'rb') as f:
-            model_bytes = f.read()
-            # Push to flaminghotcheetos
-            # Assuming S3Interface has an upload method or we mock it
-            # s3.client.put_object(Bucket=AWS_BUCKET, Key='models/cross_sectional_lgbm.txt', Body=model_bytes)
-            print("🚀 Model successfully uploaded to S3 flaminghotcheetos bucket! (Mocked via S3Interface)")
+        # Upload the main file that the bot reads
+        s3_client.upload_file(model_path, AWS_BUCKET, 'models/cross_sectional_lgbm.txt')
+        s3_client.upload_file(meta_path, AWS_BUCKET, 'models/cross_sectional_lgbm_meta.json')
+        
+        # Upload the versioned file for history/rollback
+        s3_client.upload_file(versioned_model_path, AWS_BUCKET, f'models/history/cross_sectional_lgbm_{timestamp_str}.txt')
+            
+        print(f"✅ Model and Metadata uploaded to S3 bucket '{AWS_BUCKET}'. History saved.")
             
     except ImportError:
-        print("⚠️ AWS S3 credentials or S3Interface not configured. Skipping S3 upload.")
+        print("⚠️ boto3 not installed. Skipping S3 upload.")
+    except Exception as e:
+        print(f"⚠️ S3 upload failed: {e}. Model saved locally only.")
         
     return model, features
 

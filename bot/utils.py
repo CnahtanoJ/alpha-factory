@@ -49,12 +49,12 @@ class StateManager:
 
     def save(self): self.s3.save_json(self.filename, self.state)
     def get(self, coin, key, default=0): return self.state.get(f"{coin}_{key}", default)
-    def set(self, coin, key, value): 
+    def set(self, coin, key, value, defer_save=True): 
         self.state[f"{coin}_{key}"] = value
-        self.save()
-    def clear(self, coin):
+        if not defer_save: self.save()
+    def clear(self, coin, defer_save=True):
         for k in [k for k in self.state if k.startswith(f"{coin}_")]: del self.state[k]
-        self.save()
+        if not defer_save: self.save()
 
 def send_telegram_message(text):
     """

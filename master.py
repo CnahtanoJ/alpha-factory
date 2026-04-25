@@ -8,7 +8,6 @@ Designed for local execution on your machine.
 Usage:
   python master.py ingest   --symbols BTC/USDT,ETH/USDT --timeframe 1h
   python master.py ingest   --top 50 --timeframe 15m
-  python master.py backtest
   python master.py report
   python master.py full
   python master.py status
@@ -93,7 +92,7 @@ def cmd_ingest(args):
     init_db()
     sync = SyncManager()
     
-    market = 'spot' if args.spot else 'futures'
+    market = 'futures'
     timeframes = [t.strip() for t in args.timeframe.split(',')]
     
     if args.top:
@@ -112,65 +111,37 @@ def cmd_ingest(args):
         print(f"  INGESTING: {len(symbols)} symbols | {tf} | {market}")
         print(f"{'='*60}")
         sync.bulk_sync(symbols, timeframe=tf, market=market, 
-                       target_years=args.years, start_year=args.start_year)
+                       target_years=args.years, start_year=args.start_year,
+                       skip_exchange=args.no_gap_fill)
     
     sync.close()
     print("\n✅ Data ingestion complete!")
 
 
-def cmd_backtest(args):
-    """Step 2: Run Pipeline A — Extreme Grid Search + AI Scoring"""
-    # Auto-sync live edge before backtesting
-    cmd_sync_live(args)
-    
-    from analytics.analytics import train_global_xgboost, get_latest_probabilities
-    from backtester.build_bot_blueprint import strategist_handler
-    
-    print("\n🧠 Training XGBoost model...")
-    model, features, accuracy = train_global_xgboost(market=args.market, tune_hyperparams=args.tune, force_train=args.force_train)
-    
-    ai_probs = {}
-    if model:
-        print(f"   Model accuracy: {accuracy:.2%}")
-        ai_probs = get_latest_probabilities(model, features, market=args.market)
-        print(f"   Scored {len(ai_probs)} symbols.")
-    else:
-        print("   ⚠️ No data in database. Run 'ingest' first.")
-        return
-    
-    print("\n🚀 Running Pipeline A (Grid Search)...")
-    result = strategist_handler(None, None, ai_probs=ai_probs, ai_accuracy=accuracy)
-    print(f"\n✅ Pipeline A complete: {result}")
-
-
 def cmd_report(args):
-    """Step 3: Run Pipeline B — Weekly Intelligence Report"""
+    """Run the Weekly Intelligence Cycle: Sync → OOS Simulate → Train → Report"""
     # Auto-sync live edge before report
     cmd_sync_live(args)
     
-    from analytics.analytics import train_global_xgboost, get_latest_probabilities
+    from analytics.weekly_orchestrator import run_weekly_cycle
     from analytics.generate_report import generate_report
     
-    print("\n🧠 Training XGBoost model...")
-    model, features, accuracy = train_global_xgboost(market=args.market, tune_hyperparams=args.tune, force_train=args.force_train)
-    
-    ai_probs = {}
-    if model:
-        print(f"   Model accuracy: {accuracy:.2%}")
-        ai_probs = get_latest_probabilities(model, features, market=args.market)
-    else:
-        print("   ⚠️ No data in database. Run 'ingest' first.")
-        return
+    print("\n🧠 Running Full Intelligence Cycle...")
+    cycle_results = run_weekly_cycle(
+        market=args.market,
+        force_train=args.force_train,
+        dry_run_weeks=args.dry_run_weeks,
+    )
     
     print("\n📊 Generating Weekly Intelligence Report...")
-    report_path = generate_report(ai_probs=ai_probs, ai_accuracy=accuracy)
+    report_path = generate_report(cycle_results)
     
     if report_path:
         print(f"\n✅ Report saved to: {report_path}")
 
 
 def cmd_full(args):
-    """Run the full weekly cycle: Ingest (Optional) → Train once → Pipeline A → Pipeline B"""
+    """Run the full weekly cycle: Ingest (Optional) → Sync → OOS Simulate → Train → Report"""
     from analytics.weekly_orchestrator import run_weekly_cycle
     from analytics.generate_report import generate_report
     
@@ -179,34 +150,39 @@ def cmd_full(args):
         print("\n" + "="*60)
         print("  📥 STEP 0: BOOTSTRAP INGESTION")
         print("="*60)
-        # Map market to spot flag for cmd_ingest
-        args.spot = (args.market == 'spot')
+        args.no_gap_fill = False  # Full cycle always gap-fills
         cmd_ingest(args)
     
-    # 1. 🔄 SMART SYNC: Freshness Mode (The Hyperliquid Symmetry Mapping)
-    # This catches the "Live Edge" so we trade on the current minute.
+    # 1. 🔄 SMART SYNC: Freshness Mode
     cmd_sync_live(args)
     
     print("\n" + "="*60)
     print("  🚀 STARTING FULL WEEKLY CYCLE")
-    if args.tune or args.force_train:
-        print("     🧠 MODE: ELITE RE-TRAINING (High Fidelity Intelligence)")
+    if args.force_train:
+        print("     🧠 MODE: FORCE RE-TRAINING")
     print("="*60)
     
-    # 1. Orchestrate AI Training & Strategy Discovery (Pipeline A)
-    result = run_weekly_cycle(market=args.market, tune_hyperparams=args.tune, force_train=args.force_train)
+    # 2. Run the intelligence cycle
+    cycle_results = run_weekly_cycle(
+        market=args.market,
+        force_train=args.force_train,
+        dry_run_weeks=args.dry_run_weeks,
+    )
     
-    probs = result['probs']
-    accuracy = result['accuracy']
+    sim = cycle_results.get('simulation_results')
+    meta = cycle_results.get('model_meta', {})
     
     print(f"\n✅ AI Intelligence Cycle Complete!")
-    print(f"   Symbols scored: {len(probs)}")
-    print(f"   Model accuracy: {accuracy:.2%}")
+    if sim:
+        print(f"   OOS Sharpe: {sim['sharpe']:.2f} | PF: {sim['profit_factor']:.2f} | Win Rate: {sim['win_rate']:.1%}")
+    spearman = meta.get('validation_spearman_correlation', 'N/A')
+    if isinstance(spearman, float):
+        print(f"   Model Spearman ρ: {spearman:.4f}")
     
-    # 2. Trigger Intelligence Report (Pipeline B)
+    # 3. Generate the intelligence report
     print("\n📊 Generating Master Intelligence Report...")
-    report_path = generate_report(ai_probs=probs, ai_accuracy=accuracy)
-    
+    report_path = generate_report(cycle_results)
+
 def cmd_status(args):
     """Show what data you have in the local database"""
     from data_pipeline.database import DB_PATH
@@ -315,94 +291,6 @@ def cmd_audit(args):
         print(f"  TIP: Run 'ingest' or 'sync' to attempt gap-filling for 'Dark Zones'.")
 
 
-def cmd_scout(args):
-    """Hourly Scout Loop: Fuses Static Math with Live AI Conviction."""
-    from bot.utils import S3Interface, send_telegram_message
-    from bot.config import AWS_BUCKET
-    from analytics.analytics import get_latest_probabilities, train_global_xgboost
-    from data_pipeline.hyperliquid_sync import get_hyperliquid_universe
-    import logging
-    logger = logging.getLogger(__name__)
-    
-    logger.info("📡 SCOUT: Pulling Elite Squad from S3...")
-    s3 = S3Interface(AWS_BUCKET)
-    squad = s3.load_json("elite_squad.json")
-    
-    if not squad:
-        logger.error("❌ SCOUT: No Elite Squad found on S3. Run 'weekly' first.")
-        return
-
-    # 1. Filter for Hyperliquid Tradability
-    hl_universe = get_hyperliquid_universe()
-    executable_squad = []
-    for member in squad:
-        clean_name = member['target_coin'].split("/")[0]
-        if clean_name in hl_universe:
-            executable_squad.append(member)
-    
-    logger.info(f"🎯 SCOUT: Found {len(executable_squad)} tradable candidates on Hyperliquid.")
-
-    # 2. Get Live AI Conviction
-    # Load the existing trained model from analytics/models/
-    import pickle
-    import xgboost as xgb
-    
-    model_dir = os.path.join(os.path.dirname(__file__), 'analytics', 'models')
-    xgb_path = os.path.join(model_dir, 'xgboost_futures.json')
-    rf_path = os.path.join(model_dir, 'xgboost_futures.pkl')
-    
-    # Feature list must match what analytics.py uses for training
-    xgb_features = ['rsi', 'macd', 'macd_signal', 'macd_diff', 'ema_20', 'ema_50',
-                     'ema_200', 'volatility_20', 'z_score_20', 'volume',
-                     'timeframe_minutes', 'hour_sin', 'hour_cos', 'day_sin', 'day_cos']
-    
-    ensemble = None
-    if os.path.exists(xgb_path):
-        xgb_model = xgb.XGBClassifier()
-        xgb_model.load_model(xgb_path)
-        rf_model = None
-        if os.path.exists(rf_path):
-            with open(rf_path, 'rb') as f:
-                rf_model = pickle.load(f)
-        ensemble = (xgb_model, rf_model) if rf_model else xgb_model
-        logger.info(f"SCOUT: Loaded cached AI model from {xgb_path}")
-    else:
-        logger.warning("SCOUT: No cached model found. Training a fresh one...")
-        ensemble, xgb_features, _ = train_global_xgboost(force_train=False)
-
-    if not ensemble:
-        logger.error("❌ SCOUT: AI Brain not found. Fusing with neutral index.")
-        ai_probs = {m['target_coin']: {'bull': 0.5, 'bear': 0.5} for m in executable_squad}
-    else:
-        # Get probabilities for ONLY the squad members to save time
-        ai_probs = get_latest_probabilities(ensemble, xgb_features)
-
-    # 3. Perform the Fusion
-    fused_results = []
-    for member in executable_squad:
-        probs = ai_probs.get(member['target_coin'], {'bull': 0.5, 'bear': 0.5})
-        conviction = (probs.get('bull', 0) + probs.get('bear', 0))
-        
-        # FINAL FORMULA: Static Math * Live Conviction
-        fused_score = member['score'] * conviction
-        
-        member['live_conviction'] = conviction
-        member['fused_score'] = fused_score
-        fused_results.append(member)
-
-    # 4. Rank and Upload Intelligence
-    fused_results.sort(key=lambda x: x['fused_score'], reverse=True)
-    
-    s3.save_json("live_scout_intelligence.json", fused_results)
-    
-    best = fused_results[0] if fused_results else None
-    if best:
-        msg = f"🛰️ SCOUT REFRESH\nNew Leader: {best['target_coin']}\nFused Score: {best['fused_score']:.4f}\nAI Conviction: {best['live_conviction']:.2%}"
-        logger.info(msg)
-        # send_telegram_message(msg)
-
-    logger.info("✅ SCOUT COMPLETE: Live Intelligence updated on S3.")
-
 
 def main():
     parser = argparse.ArgumentParser(
@@ -412,17 +300,14 @@ def main():
 Examples:
   python master.py status                              Check your database
   python master.py ingest --symbols BTC/USDT,ETH/USDT  Ingest specific coins
-  python master.py ingest --top 20 --timeframe 1h,15m   Ingest top 20 by volume
-  python master.py backtest                             Run grid search (Pipeline A)
-  python master.py report                               Generate intelligence report (Pipeline B)
+  python master.py ingest --top 100 --timeframe 1h,15m  Ingest top 100 by HL volume
+  python master.py report                               Run intelligence cycle + report
   python master.py full                                 Run complete weekly cycle
-  python master.py scout                                Run hourly AI fusion
 
 Recommended first-time workflow:
-  1. python master.py ingest --symbols BTC/USDT,ETH/USDT,SOL/USDT --timeframe 1h
+  1. python master.py ingest --top 100 --timeframe 1h
   2. python master.py status
-  3. python master.py backtest
-  4. python master.py report
+  3. python master.py report
         """
     )
     
@@ -440,32 +325,27 @@ Recommended first-time workflow:
                           help='Target years of history (default: 3)')
     p_ingest.add_argument('--start-year', type=int, default=2020, dest='start_year',
                           help='Start year for Binance Vision download (default: 2020)')
-    p_ingest.add_argument('--spot', action='store_true', 
-                          help='Use Spot market data instead of Futures')
+    p_ingest.add_argument('--no-gap-fill', action='store_true', dest='no_gap_fill',
+                          help='Skip CCXT exchange API gap-filling (Binance Vision only)')
     p_ingest.set_defaults(func=cmd_ingest)
     
     # Common ML Arguments
     def add_ml_args(p):
-        p.add_argument('--market', choices=['spot', 'futures'], default='futures',
-                       help='Which market data to train/scan on (default: futures)')
-        p.add_argument('--tune', action='store_true',
-                       help='Run RandomizedSearchCV to find optimal XGBoost hyperparameters')
+        p.add_argument('--market', choices=['futures'], default='futures',
+                       help='Which market data to train on (default: futures)')
         p.add_argument('--force-train', '--force', action='store_true', dest='force_train',
                        help='Force retraining the model even if a cached version exists')
+        p.add_argument('--dry-run-weeks', type=int, default=4, dest='dry_run_weeks',
+                       help='Number of weeks to simulate in OOS dry run (default: 4)')
 
-    # ── backtest ──
-    p_backtest = subparsers.add_parser('backtest', help='Run Pipeline A: Grid Search + AI Scoring')
-    add_ml_args(p_backtest)
-    p_backtest.set_defaults(func=cmd_backtest)
-    
     # ── report ──
-    p_report = subparsers.add_parser('report', help='Run Pipeline B: Weekly Intelligence Report')
+    p_report = subparsers.add_parser('report', help='Run intelligence cycle + generate report')
     add_ml_args(p_report)
     p_report.set_defaults(func=cmd_report)
     
     
     # ── full ──
-    p_full = subparsers.add_parser('full', help='Run complete end-to-end cycle (Ingest? → Train → A → B)')
+    p_full = subparsers.add_parser('full', help='Run complete end-to-end cycle (Ingest? → Sync → Train → Report)')
     # Include Ingest Args
     p_full.add_argument('--symbols', default='BTC/USDT,ETH/USDT,SOL/USDT', 
                           help='Symbols to ingest if bootstrapping')
@@ -490,10 +370,6 @@ Recommended first-time workflow:
     # ── status ──
     p_status = subparsers.add_parser('status', help='Check database contents')
     p_status.set_defaults(func=cmd_status)
-
-    # ── scout ──
-    p_scout = subparsers.add_parser('scout', help='Hourly AI re-inference and fusion')
-    p_scout.set_defaults(func=cmd_scout)
     
     args = parser.parse_args()
     

@@ -149,12 +149,12 @@ class RiskEngine:
 
         # 4. RULE 3: POC Gravity
         if is_buy and current_price > poc_price:
-            logger.warning(f"🛑 REJECTED: {coin} Long at ${current_price:.4f} is above the POC (${poc_price:.4f}). Danger of downward gravity.")
-            return False
+            logger.warning(f"⚠️ POC WARNING: {coin} Long at ${current_price:.4f} is above the POC (${poc_price:.4f}). Ignoring filter for A/B testing.")
+            # return False
 
         if not is_buy and current_price < poc_price:
-            logger.warning(f"🛑 REJECTED: {coin} Short at ${current_price:.4f} is below the POC (${poc_price:.4f}). Danger of upward snapback.")
-            return False        
+            logger.warning(f"⚠️ POC WARNING: {coin} Short at ${current_price:.4f} is below the POC (${poc_price:.4f}). Ignoring filter for A/B testing.")
+            # return False        
 
         # If it passes the bouncer, greenlight the trade
         logger.info(f"🟢 CLEARED: {coin} execution safe. OI: ${oi_usd:,.0f} | Funding: {funding:.4f}")
@@ -205,17 +205,41 @@ class RiskEngine:
 
         orders = [o for o in open_orders if o['coin'] == coin]
         
+        # 1. MATH & STATE CALCULATION 🧮 (Must be first — other blocks reference these)
+        equity = float(user_state['marginSummary']['accountValue'])
+        mid_px = float(self.info.all_mids()[coin])
+        if mid_px == 0: return
+        
+        slippage = 0.002
+                
+        raw_limit_buy = mid_px * (1 + slippage)
+        raw_limit_sell = mid_px * (1 - slippage)
+        
+        # Pre-calculate precise prices
+        limit_buy_px = self.assets.get_price_precision(coin, raw_limit_buy)
+        limit_sell_px = self.assets.get_price_precision(coin, raw_limit_sell)
+        
+        entry_usd = (equity * 0.25) # 25% of equity per leg for market-neutral basket (1.5x total leverage across 6 assets)
+        base_sz_unit = entry_usd / mid_px
+
+        # 2. POSITION STATE
         has_position = coin in portfolio
         pos_details = portfolio.get(coin)
 
         if pos_details:
             pos_size = float(pos_details.get('szi', 0.0))
             avg_entry_px = float(pos_details.get('entryPx', 0.0))
-            current_count = int(round(abs(pos_size) / base_sz_unit))
+            current_count = int(round(abs(pos_size) / base_sz_unit)) if base_sz_unit > 0 else 1
         else:
             pos_size = 0.0
             avg_entry_px = 0.0
             current_count = 0
+            
+            # P2-8: Circuit Breaker Check (Only block NEW entries, not existing position management)
+            consecutive_losses = self.memory.get('GLOBAL', 'consecutive_losses', default=0)
+            if consecutive_losses >= 3:
+                logger.warning(f"🛑 CIRCUIT BREAKER TRIPPED: {consecutive_losses} consecutive losses. Pausing {coin} entry.")
+                return
 
         # THE STRATEGY EXIT OVERRIDE
         if signal == "EXIT" and has_position:
@@ -242,29 +266,12 @@ class RiskEngine:
             self.memory.clear(coin)
             return # Stop processing, we are out!
 
-        # 2. PENDING ORDER CHECKS
+        # 3. PENDING ORDER CHECKS
         if orders:
             has_limit = any(o['orderType'] == 'Limit' for o in orders)            
             if has_limit:
                 logger.info(f"⏳ {coin}: Pending Limit Order. Waiting...")
                 return
-            
-        # 3. MATH & STATE CALCULATION 🧮
-        equity = float(user_state['marginSummary']['accountValue'])
-        mid_px = float(self.info.all_mids()[coin])
-        if mid_px == 0: return
-        
-        slippage = 0.002
-                
-        raw_limit_buy = mid_px * (1 + slippage)
-        raw_limit_sell = mid_px * (1 - slippage)
-        
-        # Pre-calculate precise prices
-        limit_buy_px = self.assets.get_price_precision(coin, raw_limit_buy)
-        limit_sell_px = self.assets.get_price_precision(coin, raw_limit_sell)
-        
-        entry_usd = (equity * 0.25) # 25% of equity per leg for market-neutral basket (1.5x total leverage across 6 assets)
-        base_sz_unit = entry_usd / mid_px
                 
         # 4. DECISION LOGIC 🧠
 
@@ -393,16 +400,21 @@ class RiskEngine:
 
             if res['status'] == 'ok':
                 filled_val = res['response']['data']['statuses'][0].get('filled', {}).get('totalSz', 0)
+                filled_float = float(filled_val)
                 
-                if float(filled_val) > 0:
-                    send_telegram_message(f"✅ SUCCESS: Filled {coin} instantly!")
+                if filled_float > 0:
+                    if filled_float < sz:
+                        send_telegram_message(f"⚠️ PARTIAL FILL: {coin} intended {sz}, got {filled_float}!")
+                        logger.warning(f"⚠️ PARTIAL FILL: {coin} intended {sz}, got {filled_float}!")
+                    else:
+                        send_telegram_message(f"✅ SUCCESS: Filled {coin} instantly!")
                     self.memory.set(coin, 'tp1_hit', False)
                     self.memory.set(coin, 'entry_time', int(time.time()))
                     time.sleep(3)
                     self.sync_unified_orders(coin, current_atr_pct, portfolio)
                 else:
-                    logger.warning(f"⚠️ Entry Failed.")
-                    send_telegram_message(f"⚠️ Entry Failed.")
+                    logger.warning(f"⚠️ Entry Failed (0 filled).")
+                    send_telegram_message(f"⚠️ Entry Failed (0 filled).")
 
             else:
                 error_msg = res.get('response', {}).get('data', 'Unknown Error')
@@ -470,9 +482,23 @@ class RiskEngine:
         # 💀 CASE A: POST-MORTEM (Position is Gone)
         # =========================================================
         if coin not in portfolio:
-            if self.memory.get(coin, 'count') > 0: 
+            if self.memory.get(coin, 'entry_time', default=0) > 0: 
+                # P2-8: Circuit Breaker Update
+                tp1_hit = self.memory.get(coin, 'tp1_hit', default=False)
+                streak = self.memory.get('GLOBAL', 'consecutive_losses', default=0)
+                
+                if tp1_hit:
+                    self.memory.set('GLOBAL', 'consecutive_losses', 0)
+                    logger.info(f"📈 {coin} closed in profit/BE. Streak reset.")
+                    current_streak = 0
+                else:
+                    streak += 1
+                    self.memory.set('GLOBAL', 'consecutive_losses', streak)
+                    logger.info(f"📉 {coin} hit hard SL. Consecutive losses: {streak}")
+                    current_streak = streak
+                    
                 logger.info(f"🔔 DETECTED EXIT: {coin} position is gone.")
-                send_telegram_message(f"🔔 NOTIFICATION: {coin} Position Closed (Hard SL, TP, or Manual).")
+                send_telegram_message(f"🔔 NOTIFICATION: {coin} Position Closed. Current Loss Streak: {current_streak}")
                 self.memory.clear(coin)
             return
 
@@ -645,8 +671,35 @@ class RiskEngine:
                 send_telegram_message(f"❌ SWITCH ABORTED: Could not close {active_coin}. Error: {error_msg}")
                 return False
                 
+            filled_val = float(res['response']['data']['statuses'][0].get('filled', {}).get('totalSz', 0))
+            if filled_val == 0:
+                logger.error(f"❌ CLOSE FAILED. 0 filled for {active_coin}.")
+                send_telegram_message(f"❌ SWITCH ABORTED: 0 filled on close for {active_coin}.")
+                return False
+            elif filled_val < abs(pos_size):
+                logger.warning(f"⚠️ PARTIAL CLOSE: {active_coin} intended {abs(pos_size)}, got {filled_val}.")
+                send_telegram_message(f"⚠️ PARTIAL CLOSE: {active_coin} intended {abs(pos_size)}, got {filled_val}.")
+                return False  # Still not fully closed, so we return False
+                
+            # P2-8: Calculate PnL for circuit breaker
+            entry_px = float(pos_data['entryPx'])
+            if pos_size > 0:
+                pnl_pct = (curr_px - entry_px) / entry_px
+            else:
+                pnl_pct = (entry_px - curr_px) / entry_px
+                
+            state_mgr = StateManager(aws_bucket)
+            streak = state_mgr.get('GLOBAL', 'consecutive_losses', default=0)
+            if pnl_pct < 0:
+                streak += 1
+                state_mgr.set('GLOBAL', 'consecutive_losses', streak)
+                logger.info(f"📉 {active_coin} closed at a loss ({pnl_pct:.2%}). Consecutive losses: {streak}")
+            else:
+                state_mgr.set('GLOBAL', 'consecutive_losses', 0)
+                logger.info(f"📈 {active_coin} closed in profit/BE ({pnl_pct:.2%}). Streak reset.")
+                
             logger.info(f"✅ CLOSING current {active_coin} position.")
-            StateManager(aws_bucket).clear(active_coin)
+            state_mgr.clear(active_coin)
             return True
 
         except Exception as e:
