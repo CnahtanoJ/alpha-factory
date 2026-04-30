@@ -91,6 +91,23 @@ def generate_report(cycle_results: dict) -> str:
     else:
         md += "> ⚠️ No OOS simulation available. This is the first training run.\n\n"
 
+    # ─── Section 2.5: Robustness (Monte Carlo) ───
+    if sim and 'mc_stats' in sim:
+        mc = sim['mc_stats']
+        md += "### 🛡️ Robustness Analysis (Monte Carlo)\n"
+        md += f"*Bootstrapped over {mc['sims']} randomized return sequences.*\n\n"
+        md += f"- **Probability of Profit**: {mc['prob_profit']:.1%}\n"
+        md += f"- **95% CI Lower Bound**: {mc['ci_lower']:+.2%}\n"
+        md += f"- **95% CI Upper Bound**: {mc['ci_upper']:+.2%}\n"
+        
+        if mc['prob_profit'] > 0.90:
+            verdict = "✅ **High Confidence**: Model edge is likely structural."
+        elif mc['prob_profit'] > 0.70:
+            verdict = "⚠️ **Moderate Confidence**: Model edge shows some sequence sensitivity."
+        else:
+            verdict = "🚨 **Low Confidence**: Model edge may be a chronological fluke."
+        md += f"\n> **Robustness Verdict**: {verdict}\n\n"
+
     # ─── Section 3: Top 10 Longs ───
     top_symbols = drivers.get('top_symbols', [])
     top_drv = drivers.get('top_drivers', {})

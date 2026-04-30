@@ -12,13 +12,13 @@ from ta.trend import EMAIndicator, MACD
 import pickle
 import json
 from scipy.stats import spearmanr
-def fetch_and_merge_symbol_data(symbol, conn):
+def fetch_and_merge_symbol_data(symbol, conn, timeframe='15m'):
     """
     Fetches ohlcv, index_ohlcv, symbol_metrics, and funding_rate for a single symbol
     and merges them into one DataFrame using forward fill.
     """
     # 1. Fetch OHLCV
-    df = pd.read_sql_query("SELECT * FROM ohlcv WHERE symbol = ? ORDER BY timestamp", conn, params=(symbol,))
+    df = pd.read_sql_query("SELECT * FROM ohlcv WHERE symbol = ? AND timeframe = ? ORDER BY timestamp", conn, params=(symbol, timeframe))
     if df.empty: return pd.DataFrame()
     df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
 
@@ -67,8 +67,8 @@ def add_time_series_features(df, btc_df=None):
     
     # Derivative Fuel
     df['basis_pct'] = (df['close'] - df['index_close']) / df['index_close']
-    df['oi_zscore'] = (df['sum_open_interest'] - df['sum_open_interest'].rolling(50).mean()) / df['sum_open_interest'].rolling(50).std()
-    df['funding_delta'] = df['last_funding_rate'].diff()
+    df['oi_usd'] = df['sum_open_interest'] * df['close']
+    df['funding_rate'] = df['last_funding_rate']
     
     # Market Correlation (Fixed to use BTC like Phase 2)
     if btc_df is not None and not btc_df.empty:
@@ -79,15 +79,17 @@ def add_time_series_features(df, btc_df=None):
     
     # Cyclic Time Features
     df['hour'] = df['timestamp'].dt.hour
-    df['hour_sin'] = np.sin(2 * np.pi * df['hour'] / 23)
-    df['hour_cos'] = np.cos(2 * np.pi * df['hour'] / 23)
+    df['hour_sin'] = np.sin(2 * np.pi * df['hour'] / 24)
+    df['hour_cos'] = np.cos(2 * np.pi * df['hour'] / 24)
     df['day_of_week_num'] = df['timestamp'].dt.dayofweek
-    df['day_sin'] = np.sin(2 * np.pi * df['day_of_week_num'] / 6)
-    df['day_cos'] = np.cos(2 * np.pi * df['day_of_week_num'] / 6)
+    df['day_sin'] = np.sin(2 * np.pi * df['day_of_week_num'] / 7)
+    df['day_cos'] = np.cos(2 * np.pi * df['day_of_week_num'] / 7)
 
     
     # Forward Return (Target Calculation)
-    df['fwd_return'] = df['close'].shift(-6) / df['close'] - 1
+    # Default: 6 bars (1.5h for 15m candles, 6h for 1h candles)
+    FWD_RETURN_BARS = 6
+    df['fwd_return'] = df['close'].shift(-FWD_RETURN_BARS) / df['close'] - 1
 
     # Strategy Loop
     # Setting use_htf=False since we don't have htf_trend calculated yet
@@ -105,22 +107,22 @@ def add_time_series_features(df, btc_df=None):
             
     return df
 
-def build_mega_dataframe():
+def build_mega_dataframe(timeframe='15m'):
     """
     Builds the massive cross-sectional dataframe.
     """
     conn = sqlite3.connect(DB_PATH)
-    symbols = pd.read_sql_query("SELECT DISTINCT symbol FROM ohlcv", conn)['symbol'].tolist()
+    symbols = pd.read_sql_query("SELECT DISTINCT symbol FROM ohlcv WHERE timeframe = ?", conn, params=(timeframe,))['symbol'].tolist()
     
     # Pre-fetch BTC data to use as the true "Market Index" for correlation (aligns with Phase 2)
-    btc_df = pd.read_sql_query("SELECT timestamp, close as btc_close FROM ohlcv WHERE symbol IN ('BTC/USDT', 'BTCUSDT', 'BTC') ORDER BY timestamp", conn)
+    btc_df = pd.read_sql_query("SELECT timestamp, close as btc_close FROM ohlcv WHERE symbol IN ('BTC/USDT', 'BTCUSDT', 'BTC') AND timeframe = ? ORDER BY timestamp", conn, params=(timeframe,))
     if not btc_df.empty:
         btc_df['timestamp'] = pd.to_datetime(btc_df['timestamp'], unit='ms')
     
     all_dfs = []
     print(f"Building Mega-DataFrame for {len(symbols)} symbols...")
     for sym in symbols:
-        df = fetch_and_merge_symbol_data(sym, conn)
+        df = fetch_and_merge_symbol_data(sym, conn, timeframe=timeframe)
         if df.empty: continue
         df = add_time_series_features(df, btc_df)
         all_dfs.append(df)
@@ -137,7 +139,7 @@ def build_mega_dataframe():
     print("Applying cross-sectional ranking...")
     
     # Columns to rank
-    continuous_features = ['rsi', 'macd', 'volatility_20', 'basis_pct', 'oi_zscore', 'funding_delta', 'sum_toptrader_long_short_ratio', 'corr_to_index']
+    continuous_features = ['rsi', 'macd', 'volatility_20', 'basis_pct', 'oi_usd', 'funding_rate', 'sum_toptrader_long_short_ratio', 'corr_to_index']
     
     for col in continuous_features:
         mega_df[f'rank_{col}'] = mega_df.groupby('timestamp')[col].rank(pct=True)
@@ -160,7 +162,7 @@ def train_cross_sectional_lgbm(mega_df):
     mega_df = mega_df.sort_values('timestamp')
     
     # Define features
-    continuous_features = ['rank_rsi', 'rank_macd', 'rank_volatility_20', 'rank_basis_pct', 'rank_oi_zscore', 'rank_funding_delta', 'rank_sum_toptrader_long_short_ratio', 'rank_corr_to_index']
+    continuous_features = ['rank_rsi', 'rank_macd', 'rank_volatility_20', 'rank_basis_pct', 'rank_oi_usd', 'rank_funding_rate', 'rank_sum_toptrader_long_short_ratio', 'rank_corr_to_index']
     time_features = ['hour_sin', 'hour_cos', 'day_sin', 'day_cos']
     
     # Extract strategy signal columns dynamically

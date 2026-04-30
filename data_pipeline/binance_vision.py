@@ -72,15 +72,25 @@ class BinanceVision:
                 with z.open(csv_filename) as f:
                     df = pd.read_csv(f, header=None)
             
-            # Map columns
-            expected_cols = self.COLUMNS.get(data_type, [])
-            df.columns = expected_cols[:len(df.columns)]
+            # Dynamically handle Binance CSVs that may or may not have headers
+            first_val = str(df.iloc[0, 0])
+            if not first_val.replace('.', '', 1).isdigit() and not first_val.replace('-', '').replace(' ', '').replace(':', '').isdigit():
+                df.columns = df.iloc[0].astype(str)
+                df = df[1:].reset_index(drop=True)
+                df = df.rename(columns={'open_time': 'timestamp'})
+            else:
+                expected_cols = self.COLUMNS.get(data_type, [])
+                df.columns = expected_cols[:len(df.columns)]
             
             # Convert timestamp columns to numeric
-            ts_cols = ['timestamp', 'create_time', 'calc_time']
+            ts_cols = ['timestamp', 'create_time', 'calc_time', 'open_time']
             for col in ts_cols:
                 if col in df.columns:
-                    df[col] = pd.to_numeric(df[col], errors='coerce')
+                    first_valid = df[col].dropna().iloc[0] if not df[col].dropna().empty else None
+                    if isinstance(first_valid, str) and '-' in first_valid:
+                        df[col] = pd.to_datetime(df[col]).astype('datetime64[ms]').astype('int64')
+                    else:
+                        df[col] = pd.to_numeric(df[col], errors='coerce')
             
             return df
             
@@ -88,7 +98,7 @@ class BinanceVision:
             print(f"Error fetching {data_type} from Binance Vision: {e}")
             return pd.DataFrame()
 
-    def fetch_history_range(self, symbol, timeframe, start_year=2020, start_month=1, data_type='klines'):
+    def fetch_history_range(self, symbol, timeframe, start_year=2020, start_month=1, start_day=1, data_type='klines'):
         """Fetches multiple months of data and returns a combined DataFrame."""
         all_dfs = []
         now = datetime.now()
@@ -109,7 +119,8 @@ class BinanceVision:
                     # Daily fallback for current/last year (not for fundingRate which is monthly only)
                     if year >= now.year - 1 and data_type != 'fundingRate':
                         print(f"  Monthly missing for {year}-{month:02d}. Trying Daily...")
-                        for day in range(1, 32):
+                        d_start = start_day if (year == start_year and month == start_month) else 1
+                        for day in range(d_start, 32):
                             try:
                                 test_date = datetime(year, month, day)
                             except ValueError: break

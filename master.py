@@ -51,9 +51,20 @@ def cmd_sync_live(args):
         print(f"   🔄 Syncing {current_tf} edge...")
         for symbol, market in pairs_to_refresh:
             candles = []
-            binance_symbol = symbol.replace('/', '')  # e.g. BTC/USDT -> BTCUSDT
+            binance_symbol = symbol.replace('/', '').replace('-', '') # e.g. BTC/USDT -> BTCUSDT
+            
+            # Map Hyperliquid 'k' prefix (kPEPE) to Binance '1000' prefix (1000PEPE)
+            if binance_symbol.startswith('k') and len(binance_symbol) > 1 and binance_symbol[1].isupper():
+                binance_symbol = "1000" + binance_symbol[1:]
+            
+            if not binance_symbol.endswith("USDT"):
+                binance_symbol += "USDT"
             try:
-                url = "https://api.binance.com/api/v3/klines"
+                if market == 'futures':
+                    url = "https://fapi.binance.com/fapi/v1/klines"
+                else:
+                    url = "https://api.binance.com/api/v3/klines"
+                
                 params = {'symbol': binance_symbol, 'interval': current_tf, 'limit': 100}
                 res = requests.get(url, params=params, timeout=10)
                 if res.status_code == 200:

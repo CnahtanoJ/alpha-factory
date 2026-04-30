@@ -51,20 +51,28 @@ class SyncManager:
         earliest, latest = self.get_sync_state(symbol, timeframe, market, data_type)
         effective_start_year = start_year
         effective_start_month = 1
+        effective_start_day = 1
         
         if latest:
             try:
                 last_dt = datetime.fromtimestamp(latest / 1000)
                 effective_start_year = last_dt.year
                 effective_start_month = last_dt.month
-                print(f"  🔄 Resuming from {effective_start_year}-{effective_start_month:02d}")
+                effective_start_day = last_dt.day
+                print(f"  🔄 Resuming from {effective_start_year}-{effective_start_month:02d}-{effective_start_day:02d}")
             except (OSError, ValueError):
                 print(f"  ⚠️ Corrupted sync state detected for {symbol}. Starting from scratch.")
                 effective_start_year = start_year
                 effective_start_month = 1
+                effective_start_day = 1
         
         # Binance Vision uses clean symbol format (BTCUSDT)
         binance_symbol = symbol.replace("/", "").replace("-", "")
+        
+        # Map Hyperliquid 'k' prefix (kPEPE) to Binance '1000' prefix (1000PEPE)
+        if binance_symbol.startswith('k') and len(binance_symbol) > 1 and binance_symbol[1].isupper():
+            binance_symbol = "1000" + binance_symbol[1:]
+            
         if not binance_symbol.endswith("USDT"):
             binance_symbol += "USDT"
         
@@ -72,11 +80,19 @@ class SyncManager:
             binance_symbol, timeframe, 
             start_year=effective_start_year, 
             start_month=effective_start_month,
+            start_day=effective_start_day,
             data_type=data_type
         )
         
         if df.empty:
             print(f"  ⚠️ No data found on Binance Vision for {symbol} ({data_type}).")
+            # Mark it as checked up to today to prevent 72-month re-scans on every run
+            now_ms = int(datetime.now().timestamp() * 1000)
+            
+            # Preserve earliest if we already had some data, otherwise use now_ms
+            cur_earliest, _ = self.get_sync_state(symbol, timeframe, market, data_type)
+            final_earliest = cur_earliest if cur_earliest else now_ms
+            self.update_sync_state(symbol, timeframe, market, data_type, final_earliest, now_ms)
             return 0
         
         # Valid range: 2017-01-01 to 2027-01-01
@@ -86,11 +102,24 @@ class SyncManager:
         # Bulk insert to SQLite, aggressively filtering bad timestamps
         insert_data = []
         for _, row in df.iterrows():
-            ts = int(row.get('timestamp') or row.get('calc_time') or row.get('create_time'))
+            raw_ts = row.get('timestamp')
+            if pd.isna(raw_ts):
+                raw_ts = row.get('calc_time')
+            if pd.isna(raw_ts):
+                raw_ts = row.get('create_time')
+                
+            if pd.isna(raw_ts):
+                continue
+                
+            ts = int(raw_ts)
             
             # Normalize 16-digit microseconds to 13-digit milliseconds
             if ts > 9999999999999:
                 ts = ts // 1000
+            
+            # Normalize 10-digit seconds to 13-digit milliseconds
+            if ts < 9999999999:
+                ts = ts * 1000
                 
             if valid_min_ms <= ts <= valid_max_ms:
                 if data_type == 'klines':
@@ -107,11 +136,11 @@ class SyncManager:
                     )
                 elif data_type == 'metrics':
                     insert_data.append(
-                        (ts, int(row['create_time']), symbol,
-                         float(row['sum_open_interest']), float(row['sum_open_interest_value']),
-                         float(row['count_toptrader_long_short_ratio']), float(row['sum_toptrader_long_short_ratio']),
-                         float(row['count_long_short_ratio']), float(row['sum_long_short_ratio']),
-                         float(row['count_taker_long_short_vol_ratio']), float(row['sum_taker_long_short_vol_ratio']))
+                        (ts, int(row.get('create_time', ts)), symbol,
+                         float(row.get('sum_open_interest', 0)), float(row.get('sum_open_interest_value', 0)),
+                         float(row.get('count_toptrader_long_short_ratio', 0)), float(row.get('sum_toptrader_long_short_ratio', 0)),
+                         float(row.get('count_long_short_ratio', 0)), float(row.get('sum_long_short_ratio', 0)),
+                         float(row.get('count_taker_long_short_vol_ratio', 0)), float(row.get('sum_taker_long_short_vol_ratio', 0)))
                     )
                 elif data_type == 'fundingRate':
                     insert_data.append(
@@ -158,11 +187,15 @@ class SyncManager:
         print(f"  ✅ Synced {len(insert_data)} rows of {data_type} from Binance Vision.")
         return len(insert_data)
 
-    def sync_from_exchange(self, symbol, timeframe='1h', market='futures', target_years=3):
+    def sync_from_exchange(self, symbol, timeframe='1h', market='futures', target_years=3, data_type='klines'):
         """
         Fills gaps using the live CCXT exchange API.
         Walks backwards from the earliest known data point.
         """
+        if data_type != 'klines':
+            print(f"  ⚠️ sync_from_exchange currently only supports 'klines' (OHLCV). Skipping {data_type}.")
+            return 0
+
         print(f"🔄 Gap-filling {symbol} ({timeframe}) [{market}] from exchange API...")
         
         self.exchange.options['defaultType'] = 'future'
@@ -171,7 +204,7 @@ class SyncManager:
         now_ms = int(datetime.now().timestamp() * 1000)
         target_start_ms = now_ms - int(target_delta.total_seconds() * 1000)
         
-        earliest, latest = self.get_sync_state(symbol, timeframe, market)
+        earliest, latest = self.get_sync_state(symbol, timeframe, market, data_type)
         limit = 1000
         total_synced = 0
         
@@ -205,7 +238,7 @@ class SyncManager:
                     
                     # Update state
                     new_latest = max(new_data, key=lambda x: x[0])[0]
-                    self.update_sync_state(symbol, timeframe, market, 'klines', earliest, new_latest)
+                    self.update_sync_state(symbol, timeframe, market, data_type, earliest, new_latest)
                     latest = new_latest
                     current_forward = new_latest
                     total_synced += len(new_data)
@@ -253,7 +286,7 @@ class SyncManager:
                 if not latest:
                     latest = max(new_data, key=lambda x: x[0])[0]
                 
-                self.update_sync_state(symbol, timeframe, market, 'klines', earliest, latest)
+                self.update_sync_state(symbol, timeframe, market, data_type, earliest, latest)
                 current_since = earliest
                 total_synced += len(new_data)
                 
@@ -280,6 +313,9 @@ class SyncManager:
           1. Bulk download from Binance Vision (free, fast)
           2. Fill remaining gaps from exchange API (unless skip_exchange=True)
         """
+        import time
+        start_time = time.time()
+        
         print(f"\n{'='*60}")
         print(f"  Syncing: {symbol} | {timeframe} | {market}")
         print(f"{'='*60}")
@@ -314,6 +350,9 @@ class SyncManager:
             )
             count = cursor.fetchone()['cnt']
             print(f"  📊 Total: {count:,} candles from {start} to {end}")
+            
+        elapsed = time.time() - start_time
+        print(f"  ⏱️ Time Spent: {elapsed:.2f} seconds")
 
     def bulk_sync(self, symbols, timeframe='1h', market='futures', target_years=3, start_year=2020, skip_exchange=False):
         """Syncs multiple symbols sequentially."""

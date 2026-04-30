@@ -40,7 +40,7 @@ def get_feature_names():
     """Returns the canonical feature list used by the LightGBM model."""
     continuous_features = [
         'rank_rsi', 'rank_macd', 'rank_volatility_20', 'rank_basis_pct',
-        'rank_oi_zscore', 'rank_funding_delta',
+        'rank_oi_usd', 'rank_funding_rate',
         'rank_sum_toptrader_long_short_ratio', 'rank_corr_to_index'
     ]
     time_features = ['hour_sin', 'hour_cos', 'day_sin', 'day_cos']
@@ -130,6 +130,7 @@ def extract_per_asset_drivers(
 
 def run_weekly_cycle(
     market='futures',
+    timeframe='15m',
     force_train=False,
     dry_run_weeks=4,
     top_n=10,
@@ -161,7 +162,7 @@ def run_weekly_cycle(
     # STEP 0: BUILD MEGA-DATAFRAME
     # =========================================================
     logger.info("📊 WEEKLY CYCLE: Building Mega-DataFrame...")
-    mega_df = build_mega_dataframe()
+    mega_df = build_mega_dataframe(timeframe=timeframe)
 
     if mega_df.empty:
         logger.error("❌ WEEKLY CYCLE: No data available. Run 'ingest' first.")
@@ -199,7 +200,9 @@ def run_weekly_cycle(
 
             simulation_results = simulate_portfolio(
                 oos_df, oos_predictions, prev_features,
-                top_n=top_n, bottom_n=bottom_n
+                top_n=top_n, bottom_n=bottom_n,
+                timeframe=timeframe,
+                weighting_mode='risk_parity'
             )
 
             from backtester.dry_run_simulator import format_simulation_summary

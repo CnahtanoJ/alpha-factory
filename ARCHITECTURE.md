@@ -191,7 +191,7 @@ A **LightGBM regression model** trained on cross-sectionally ranked features to 
 
 | Category | Features |
 |:--|:--|
-| **Ranked Continuous** | `rank_rsi`, `rank_macd`, `rank_volatility_20`, `rank_basis_pct`, `rank_oi_zscore`, `rank_funding_delta`, `rank_sum_toptrader_long_short_ratio`, `rank_corr_to_index` |
+| **Ranked Continuous** | `rank_rsi`, `rank_macd`, `rank_volatility_20`, `rank_basis_pct`, `rank_oi_usd`, `rank_funding_rate`, `rank_sum_toptrader_long_short_ratio`, `rank_corr_to_index` |
 | **Time-Aware** | `hour_sin`, `hour_cos`, `day_sin`, `day_cos` |
 | **Strategy Signals** | `sig_SimpleBreakout`, `sig_EMACrossover`, `sig_MACDStrategy`, ... (12 total) |
 
@@ -249,7 +249,7 @@ The LLM receives the **full model context**, not just numbers:
 - Model training metadata
 
 This enables the AI to write intelligent regime analysis like:
-> *"The model's dominant reliance on rank_funding_delta (23.1%) and rank_oi_zscore (18.7%) indicates a derivatives-driven regime where funding rate arbitrage and open interest anomalies provide the primary alpha signal..."*
+> *"The model's dominant reliance on rank_funding_rate (23.1%) and rank_oi_usd (18.7%) indicates a derivatives-driven regime where funding rate arbitrage and open interest anomalies provide the primary alpha signal..."*
 
 ---
 

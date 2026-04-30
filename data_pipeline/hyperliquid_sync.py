@@ -146,6 +146,18 @@ def get_hl_top_by_volume(limit=100):
                 assets.append({'name': name, 'volume': day_vol})
                 
             assets.sort(key=lambda x: x['volume'], reverse=True)
+            
+            # Proof of Work: Dump the top assets with volumes to a markdown file
+            try:
+                with open("top_100_hl_volume.md", "w", encoding="utf-8") as f:
+                    f.write(f"# Top {limit} Hyperliquid Assets by 24h Volume\n\n")
+                    f.write("| Rank | Asset | 24h Volume (USDC) |\n")
+                    f.write("|------|-------|-------------------|\n")
+                    for rank, asset in enumerate(assets[:limit], 1):
+                        f.write(f"| {rank} | **{asset['name']}** | ${asset['volume']:,.2f} |\n")
+            except Exception as e:
+                print(f"  ⚠️ Warning: Could not save proof of volume file: {e}")
+                
             return [a['name'] for a in assets[:limit]]
     except Exception as e:
         print(f"Error fetching top HL assets: {e}")

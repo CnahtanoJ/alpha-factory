@@ -201,7 +201,7 @@ class RiskEngine:
             except Exception as e:
                 logger.error(f"❌ Failed to cancel {o['oid']}: {e}")
 
-    def execute_logic(self, coin, signal, timeframe, current_atr_pct, portfolio, user_state, open_orders):
+    def execute_logic(self, coin, signal, timeframe, current_atr_pct, portfolio, user_state, open_orders, override_usd=None):
 
         orders = [o for o in open_orders if o['coin'] == coin]
         
@@ -210,7 +210,7 @@ class RiskEngine:
         mid_px = float(self.info.all_mids()[coin])
         if mid_px == 0: return
         
-        slippage = 0.002
+        slippage = 0.015
                 
         raw_limit_buy = mid_px * (1 + slippage)
         raw_limit_sell = mid_px * (1 - slippage)
@@ -219,7 +219,12 @@ class RiskEngine:
         limit_buy_px = self.assets.get_price_precision(coin, raw_limit_buy)
         limit_sell_px = self.assets.get_price_precision(coin, raw_limit_sell)
         
-        entry_usd = (equity * 0.25) # 25% of equity per leg for market-neutral basket (1.5x total leverage across 6 assets)
+        if override_usd:
+            entry_usd = override_usd
+            logger.info(f"📊 Using RISK PARITY sizing: ${entry_usd:.2f} for {coin}")
+        else:
+            entry_usd = (equity * 0.15) # 15% of equity per leg for market-neutral basket (0.9x total leverage across 6 assets)
+            
         base_sz_unit = entry_usd / mid_px
 
         # 2. POSITION STATE
@@ -294,7 +299,7 @@ class RiskEngine:
 
                 last_entry_time = self.memory.get(coin, 'entry_time', 0)
                 current_time = int(time.time())
-                MIN_HOLD_SECONDS = 1800
+                # MIN_HOLD_SECONDS is already defined above from HOLD_MAP (L-2 Fix)
                 time_held = current_time - last_entry_time
 
                 current_pnl = (mid_px - avg_entry_px) / avg_entry_px
@@ -440,7 +445,7 @@ class RiskEngine:
         # 2. Cancel EVERYTHING (Clear the board)
         try: self.cancel_all_orders(coin)
         except: pass
-        time.sleep(5)
+        time.sleep(1) # L-4 Fix: Reduce naked exposure
         
         # 3. Place NEW Unified TP/SL
         logger.info(f"🛡️ REFRESHING TP/SL: Total {total_sz} @ {avg_entry} | ATR: {current_atr_pct:.2%}")
@@ -557,7 +562,8 @@ class RiskEngine:
         if not self.memory.get(coin, 'tp1_hit'):
             
             # A. Calculate where TP1 *should* be to identify the order
-            tp_dist = 0.015
+            # Use same multiplier (1.5) as sync_unified_orders (L-3 Fix)
+            tp_dist = current_atr_pct * 1.5
             target_px = entry_px * (1 + tp_dist) if is_long else entry_px * (1 - tp_dist)
             
             # B. Look for the TP1 Limit Order
@@ -650,7 +656,7 @@ class RiskEngine:
 
         pos_size = float(pos_data['szi'])
         is_buy = pos_size < 0  # If Short (-), we Buy to close. If Long (+), we Sell to close.
-        slippage = 0.002
+        slippage = 0.015
         
         raw_limit_px = curr_px * (1 + slippage) if is_buy else curr_px * (1 - slippage)
         limit_px = temp_assets.get_price_precision(active_coin, raw_limit_px)
@@ -687,19 +693,18 @@ class RiskEngine:
                 pnl_pct = (curr_px - entry_px) / entry_px
             else:
                 pnl_pct = (entry_px - curr_px) / entry_px
-                
-            state_mgr = StateManager(aws_bucket)
-            streak = state_mgr.get('GLOBAL', 'consecutive_losses', default=0)
+
+            streak = self.memory.get('GLOBAL', 'consecutive_losses', default=0)
             if pnl_pct < 0:
                 streak += 1
-                state_mgr.set('GLOBAL', 'consecutive_losses', streak)
+                self.memory.set('GLOBAL', 'consecutive_losses', streak)
                 logger.info(f"📉 {active_coin} closed at a loss ({pnl_pct:.2%}). Consecutive losses: {streak}")
             else:
-                state_mgr.set('GLOBAL', 'consecutive_losses', 0)
+                self.memory.set('GLOBAL', 'consecutive_losses', 0)
                 logger.info(f"📈 {active_coin} closed in profit/BE ({pnl_pct:.2%}). Streak reset.")
                 
             logger.info(f"✅ CLOSING current {active_coin} position.")
-            state_mgr.clear(active_coin)
+            self.memory.clear(active_coin)
             return True
 
         except Exception as e:
