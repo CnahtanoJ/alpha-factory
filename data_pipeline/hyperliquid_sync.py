@@ -1,7 +1,10 @@
+import time
+import json
+import requests
+import pandas as pd
+from concurrent.futures import ThreadPoolExecutor
 from hyperliquid.info import Info
 from hyperliquid.utils import constants
-import time
-import pandas as pd
 
 def get_hyperliquid_universe(testnet=False):
     """
@@ -122,9 +125,6 @@ def get_hl_top_by_volume(limit=100):
     Fetches the top N assets on Hyperliquid by 24h volume.
     Returns a list of symbol names.
     """
-    import requests
-    import json
-    
     url = "https://api.hyperliquid.xyz/info"
     headers = {"Content-Type": "application/json"}
     payload = {"type": "metaAndAssetCtxs"}
@@ -169,9 +169,6 @@ def get_live_meta_ctx():
     Useful for live inference of funding, OI, and oracle price.
     Returns: {'BTC': {'funding': 0.0001, 'openInterest': 100.5, 'oraclePx': 65000.0}, ...}
     """
-    import requests
-    import json
-    
     url = "https://api.hyperliquid.xyz/info"
     headers = {"Content-Type": "application/json"}
     payload = {"type": "metaAndAssetCtxs"}

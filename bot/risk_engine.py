@@ -16,25 +16,50 @@ class RiskEngine:
         # DCA SETTINGS
         self.dca_spacing = 0.02
 
-    def check_safety(self, user_state):
+    def get_unified_equity(self):
+        """
+        Calculates true net equity for Unified Accounts.
+        Sums Spot USDC balance + Perps Unrealized PnL.
+        """
         try:
-            used = float(user_state['marginSummary']['totalMarginUsed'])
-            val = float(user_state['marginSummary']['accountValue'])
+            # 1. Get Spot Balances
+            spot_state = self.info.spot_user_state(self.address)
+            spot_usdc = sum(float(b['total']) for b in spot_state.get('balances', []) if b['coin'] == 'USDC')
+            
+            # 2. Get Perps State (for Margin and UnPnL)
+            user_state = self.info.user_state(self.address)
+            summary = user_state.get('crossMarginSummary') or user_state.get('marginSummary', {})
+            used_margin = float(summary.get('totalMarginUsed', 0))
+            
+            # 3. Aggregate Unrealized PnL
+            unrealized_pnl = 0
+            for p in user_state.get('assetPositions', []):
+                unrealized_pnl += float(p['position'].get('unrealizedPnl', 0))
+            
+            total_equity = spot_usdc + unrealized_pnl
+            return total_equity, used_margin, user_state
+        except Exception as e:
+            logger.error(f"❌ Failed to fetch unified equity: {e}")
+            return 0, 0, {}
+
+    def check_safety(self):
+        """Checks for bankruptcy and margin limits using Unified Equity."""
+        try:
+            val, used, _ = self.get_unified_equity()
             
             # 1. Check for Bankruptcy
-            if val == 0: 
-                logger.error("🚨 CRITICAL: Account Value is 0! Stopping.")
+            if val <= 0: 
+                logger.error("🚨 CRITICAL: Unified Account Value is 0 or negative! Stopping.")
                 return False
             
             # 2. Check Margin Usage
             curr_usage = used / val
             if curr_usage > MARGIN_LIMIT: 
-                logger.warning(f"⚠️ HIGH RISK: Margin Usage {curr_usage:.2f} > {MARGIN_LIMIT}. Pausing new actions.")
-                send_telegram_message(f"⚠️ High Margin Alert: {curr_usage:.2%}. Pausing new actions.")
+                logger.warning(f"⚠️ HIGH RISK: Unified Margin Usage {curr_usage:.2%}. Limit: {MARGIN_LIMIT:.2%}")
+                send_telegram_message(f"⚠️ High Margin Alert: {curr_usage:.2%}. Pausing new entries.")
                 return False
             
             return True
-
         except Exception as e:
             logger.error(f"❌ SAFETY CHECK FAILED: {e}")
             return False
@@ -205,8 +230,9 @@ class RiskEngine:
 
         orders = [o for o in open_orders if o['coin'] == coin]
         
-        # 1. MATH & STATE CALCULATION 🧮 (Must be first — other blocks reference these)
-        equity = float(user_state['marginSummary']['accountValue'])
+        # 1. MATH & STATE CALCULATION 🧮
+        equity, _, _ = self.get_unified_equity()
+        
         mid_px = float(self.info.all_mids()[coin])
         if mid_px == 0: return
         
@@ -223,7 +249,7 @@ class RiskEngine:
             entry_usd = override_usd
             logger.info(f"📊 Using RISK PARITY sizing: ${entry_usd:.2f} for {coin}")
         else:
-            entry_usd = (equity * 0.15) # 15% of equity per leg for market-neutral basket (0.9x total leverage across 6 assets)
+            entry_usd = (equity * 0.15) # 15% of total equity per leg
             
         base_sz_unit = entry_usd / mid_px
 

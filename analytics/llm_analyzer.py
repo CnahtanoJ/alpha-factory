@@ -21,13 +21,14 @@ You will receive:
 2. FEATURE IMPORTANCE: The model's top drivers ranked by gain. This tells you what market dynamics the model is exploiting.
 3. PER-ASSET DRIVERS: For the Top 10 and Bottom 10 assets, the extreme features that explain why the model ranked them where it did.
 4. MODEL METADATA: Validation RMSE and Spearman correlation from training.
+5. ROBUSTNESS ANALYSIS (Monte Carlo): Probability of Profit and 95% Confidence Intervals from 2,500+ bootstrap simulations. This tells you if the result is a "chronological fluke."
 
 YOUR JOB:
 Write a 3-paragraph Executive Intelligence Verdict:
 
 Paragraph 1 — REGIME ANALYSIS: Based on the feature importance, identify what market regime the model is detecting (e.g., momentum regime, mean-reversion, funding arbitrage, correlation breakdown). Be specific about which features dominate and what that implies.
 
-Paragraph 2 — CONVICTION ASSESSMENT: Evaluate the OOS simulation metrics honestly. Is the Sharpe realistic or suspicious? Is the win rate too high (overfit warning)? Is the drawdown acceptable? Compare to institutional benchmarks (Sharpe > 1.5 is excellent, > 2.5 is suspicious for crypto).
+Paragraph 2 — CONVICTION & ROBUSTNESS: Evaluate the OOS simulation metrics and the Monte Carlo results. Is the Sharpe realistic? More importantly, does the Monte Carlo CI Lower Bound stay positive? If Probability of Profit is < 80%, be extremely skeptical regardless of the Sharpe.
 
 Paragraph 3 — RISK WARNINGS: Identify the top 3 risks you see. These could include: concentration risk (same sector in top/bottom), regime change fragility, features that might be stale, macro catalysts that could invalidate the model's thesis.
 
@@ -110,6 +111,12 @@ def build_llm_context(
         lines.append(f"  Win Rate:         {simulation_results['win_rate']:.1%}")
         lines.append(f"  Max Drawdown:     {simulation_results['max_drawdown']:.2%}")
         lines.append(f"  Rebalance Count:  {simulation_results['n_rebalances']}")
+        
+        if 'mc_stats' in simulation_results:
+            mc = simulation_results['mc_stats']
+            lines.append(f"  MC Prob. Profit:  {mc['prob_profit']:.1%}")
+            lines.append(f"  MC 95% CI Lower:  {mc['ci_lower']:+.2%}")
+            lines.append(f"  MC 95% CI Upper:  {mc['ci_upper']:+.2%}")
     else:
         lines.append("  No OOS simulation available (first run or force-train).")
 

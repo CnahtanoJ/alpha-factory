@@ -1,17 +1,24 @@
+import os
+import json
+import sqlite3
+import datetime
 import pandas as pd
 import numpy as np
-import sqlite3
-import os
-import ta
 import lightgbm as lgb
+import xgboost as xgb
+import optuna
+from scipy.stats import spearmanr
+from ta.momentum import RSIIndicator
+from ta.trend import MACD
 from bot.strategies import STRATEGY_CONFIG
 from data_pipeline.database import DB_PATH
-from ta.volatility import BollingerBands
-from ta.momentum import RSIIndicator
-from ta.trend import EMAIndicator, MACD
-import pickle
-import json
-from scipy.stats import spearmanr
+
+try:
+    import boto3
+    from bot.config import AWS_BUCKET
+except ImportError:
+    boto3 = None
+    AWS_BUCKET = None
 def fetch_and_merge_symbol_data(symbol, conn, timeframe='15m'):
     """
     Fetches ohlcv, index_ohlcv, symbol_metrics, and funding_rate for a single symbol
@@ -152,7 +159,7 @@ def build_mega_dataframe(timeframe='15m'):
     
     return mega_df
 
-def train_cross_sectional_lgbm(mega_df):
+def prepare_training_data(mega_df):
     """
     Phase 3: Chronological Walk-Forward Split, LightGBM Training, and S3 Export.
     """
@@ -179,85 +186,137 @@ def train_cross_sectional_lgbm(mega_df):
     X_train, y_train = X.iloc[:split_idx], y.iloc[:split_idx]
     X_val, y_val = X.iloc[split_idx:], y.iloc[split_idx:]
     
-    print(f"Training on {len(X_train)} samples, Validating on {len(X_val)} samples...")
+    return X_train, y_train, X_val, y_val, features
+
+def optimize_lgbm_hyperparameters(X_train, y_train, X_val, y_val, n_trials=50):
+    """
+    Uses Optuna to find the best hyperparameters for LightGBM.
+    """
+    print(f"🚀 Starting Optuna HPO with {n_trials} trials...")
     
-    # LightGBM Dataset
-    train_data = lgb.Dataset(X_train, label=y_train)
-    val_data = lgb.Dataset(X_val, label=y_val, reference=train_data)
+    def objective(trial):
+        params = {
+            'objective': 'regression',
+            'metric': 'rmse',
+            'boosting_type': 'gbdt',
+            'verbosity': -1,
+            'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.2, log=True),
+            'num_leaves': trial.suggest_int('num_leaves', 16, 128),
+            'max_depth': trial.suggest_int('max_depth', 3, 12),
+            'feature_fraction': trial.suggest_float('feature_fraction', 0.5, 1.0),
+            'bagging_fraction': trial.suggest_float('bagging_fraction', 0.5, 1.0),
+            'bagging_freq': trial.suggest_int('bagging_freq', 1, 7),
+            'min_child_samples': trial.suggest_int('min_child_samples', 5, 100),
+        }
+        
+        train_data = lgb.Dataset(X_train, label=y_train)
+        val_data = lgb.Dataset(X_val, label=y_val, reference=train_data)
+        
+        model = lgb.train(
+            params,
+            train_data,
+            num_boost_round=500,
+            valid_sets=[val_data],
+            callbacks=[lgb.early_stopping(stopping_rounds=25)]
+        )
+        
+        return model.best_score['valid']['rmse']
+
+    study = optuna.create_study(direction='minimize')
+    study.optimize(objective, n_trials=n_trials)
     
-    params = {
+    print(f"✅ Best Trial: RMSE {study.best_value:.4f}")
+    return study.best_params
+
+def train_ensemble_models(mega_df, optimized_params=None):
+    """
+    Phase 4: Train an ensemble of LightGBM + XGBoost for maximum robustness.
+    """
+    X_train, y_train, X_val, y_val, features = prepare_training_data(mega_df)
+    
+    # 1. Train LightGBM
+    print("🧠 Training LightGBM...")
+    train_data_lgb = lgb.Dataset(X_train, label=y_train)
+    val_data_lgb = lgb.Dataset(X_val, label=y_val, reference=train_data_lgb)
+    
+    lgb_params = {
         'objective': 'regression',
         'metric': 'rmse',
         'boosting_type': 'gbdt',
-        'learning_rate': 0.05,
-        'num_leaves': 31,
-        'max_depth': -1,
-        'feature_fraction': 0.8,
-        'verbose': -1
+        'verbose': -1,
+        **(optimized_params if optimized_params else {'learning_rate': 0.05, 'num_leaves': 31})
     }
     
-    # Train Model
-    callbacks = [lgb.early_stopping(stopping_rounds=50), lgb.log_evaluation(period=50)]
-    model = lgb.train(
-        params,
-        train_data,
+    lgb_model = lgb.train(
+        lgb_params,
+        train_data_lgb,
         num_boost_round=1000,
-        valid_sets=[train_data, val_data],
-        valid_names=['train', 'valid'],
-        callbacks=callbacks
+        valid_sets=[val_data_lgb],
+        callbacks=[lgb.early_stopping(stopping_rounds=50)]
     )
     
-    print(f"Best Validation RMSE: {model.best_score['valid']['rmse']:.4f}")
+    # 2. Train XGBoost
+    print("🧠 Training XGBoost...")
+    xgb_model = xgb.XGBRegressor(
+        n_estimators=1000,
+        learning_rate=0.05,
+        max_depth=6,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        early_stopping_rounds=50,
+        verbosity=0
+    )
+    xgb_model.fit(X_train, y_train, eval_set=[(X_val, y_val)], verbose=False)
     
-    # Calculate Spearman Correlation for Validation Set
-    val_preds = model.predict(X_val)
-    spearman_corr, p_value = spearmanr(val_preds, y_val)
-    print(f"Validation Spearman Correlation: {spearman_corr:.4f} (p-value: {p_value:.4f})")
+    # 3. Evaluate Ensemble (Averaging Ranks)
+    lgb_preds = lgb_model.predict(X_val)
+    xgb_preds = xgb_model.predict(X_val)
+    ensemble_preds = (lgb_preds + xgb_preds) / 2.0
     
-    # Save Model Locally
-    import datetime
+    spearman_corr, p_value = spearmanr(ensemble_preds, y_val)
+    print(f"Validation Ensemble Spearman Correlation: {spearman_corr:.4f}")
+    
+    # Save Models Locally
     timestamp_str = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d_%H%M%S")
     model_dir = os.path.join(os.path.dirname(__file__), 'models')
     os.makedirs(model_dir, exist_ok=True)
-    model_path = os.path.join(model_dir, 'cross_sectional_lgbm.txt')
-    meta_path = os.path.join(model_dir, 'cross_sectional_lgbm_meta.json')
     
-    versioned_model_path = os.path.join(model_dir, f'cross_sectional_lgbm_{timestamp_str}.txt')
+    lgb_path = os.path.join(model_dir, 'cross_sectional_lgbm.txt')
+    xgb_path = os.path.join(model_dir, 'cross_sectional_xgboost.json')
+    meta_path = os.path.join(model_dir, 'cross_sectional_lgbm_meta.json') # Kept as lgbm_meta for legacy compatibility
     
-    model.save_model(model_path)
-    model.save_model(versioned_model_path)
-    print(f"Model saved locally to {model_path} and {versioned_model_path}")
+    lgb_model.save_model(lgb_path)
+    xgb_model.save_model(xgb_path)
+    
+    # Save versioned
+    lgb_model.save_model(os.path.join(model_dir, f'lgbm_{timestamp_str}.txt'))
+    xgb_model.save_model(os.path.join(model_dir, f'xgboost_{timestamp_str}.json'))
     
     with open(meta_path, 'w') as f:
         json.dump({
-            'validation_rmse': float(model.best_score['valid']['rmse']),
             'validation_spearman_correlation': float(spearman_corr),
             'spearman_p_value': float(p_value),
-            'timestamp': timestamp_str
+            'timestamp': timestamp_str,
+            'is_ensemble': True
         }, f, indent=4)
-    print(f"Metadata saved locally to {meta_path}")
     
     # S3 Export
-    try:
-        import boto3
-        from bot.config import AWS_BUCKET
-        s3_client = boto3.client('s3')
-        
-        # Upload the main file that the bot reads
-        s3_client.upload_file(model_path, AWS_BUCKET, 'models/cross_sectional_lgbm.txt')
-        s3_client.upload_file(meta_path, AWS_BUCKET, 'models/cross_sectional_lgbm_meta.json')
-        
-        # Upload the versioned file for history/rollback
-        s3_client.upload_file(versioned_model_path, AWS_BUCKET, f'models/history/cross_sectional_lgbm_{timestamp_str}.txt')
+    if boto3:
+        try:
+            s3_client = boto3.client('s3')
+            s3_client.upload_file(lgb_path, AWS_BUCKET, 'models/cross_sectional_lgbm.txt')
+            s3_client.upload_file(xgb_path, AWS_BUCKET, 'models/cross_sectional_xgboost.json')
+            s3_client.upload_file(meta_path, AWS_BUCKET, 'models/cross_sectional_lgbm_meta.json')
+            print(f"✅ Ensemble Models and Metadata uploaded to S3 bucket '{AWS_BUCKET}'.")
+        except Exception as e:
+            print(f"⚠️ S3 upload failed: {e}")
             
-        print(f"✅ Model and Metadata uploaded to S3 bucket '{AWS_BUCKET}'. History saved.")
-            
-    except ImportError:
-        print("⚠️ boto3 not installed. Skipping S3 upload.")
-    except Exception as e:
-        print(f"⚠️ S3 upload failed: {e}. Model saved locally only.")
-        
-    return model, features
+    return (lgb_model, xgb_model), features
+
+def train_cross_sectional_lgbm(mega_df, optimized_params=None):
+    """Legacy wrapper for weekly cycle compatibility."""
+    ensemble, features = train_ensemble_models(mega_df, optimized_params)
+    return ensemble[0], features # Return LightGBM for Step 3/4 which currently only support one model
 
 if __name__ == "__main__":
     mega_df = build_mega_dataframe()

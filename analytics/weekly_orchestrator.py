@@ -199,7 +199,7 @@ def run_weekly_cycle(
             oos_predictions = previous_model.predict(X_oos)
 
             simulation_results = simulate_portfolio(
-                oos_df, oos_predictions, prev_features,
+                oos_df, oos_predictions,
                 top_n=top_n, bottom_n=bottom_n,
                 timeframe=timeframe,
                 weighting_mode='risk_parity'
@@ -221,6 +221,38 @@ def run_weekly_cycle(
     logger.info("🧠 WEEKLY CYCLE: Training NEW LightGBM model...")
 
     model, features = train_cross_sectional_lgbm(mega_df)
+
+    # ─── ELITE GATEKEEPER ───
+    # We load the meta to check the Spearman Correlation
+    model_meta = {}
+    if os.path.exists(META_PATH):
+        with open(META_PATH, 'r') as f:
+            model_meta = json.load(f)
+            
+    spearman_corr = model_meta.get('validation_spearman_correlation', 0)
+    
+    if spearman_corr < 0.05:
+        logger.warning(f"🚨 GATEKEEPER REJECTION: Spearman={spearman_corr:.4f} is too low.")
+        logger.info("🔄 Triggering Optuna HPO to find a more robust model...")
+        
+        from analytics.cross_sectional import prepare_training_data, optimize_lgbm_hyperparameters
+        X_train, y_train, X_val, y_val, features = prepare_training_data(mega_df)
+        best_params = optimize_lgbm_hyperparameters(X_train, y_train, X_val, y_val, n_trials=30)
+        
+        # Re-train with optimized parameters
+        model, features = train_cross_sectional_lgbm(mega_df, optimized_params=best_params)
+        
+        # Reload meta after re-train
+        with open(META_PATH, 'r') as f:
+            model_meta = json.load(f)
+        spearman_corr = model_meta.get('validation_spearman_correlation', 0)
+        
+        if spearman_corr < 0.05:
+            logger.error(f"❌ OPTIMIZATION FAILED: Spearman={spearman_corr:.4f} still below threshold.")
+            logger.error("🛑 CRITICAL: Deployment aborted to protect capital.")
+            return {'status': 'FAIL', 'reason': 'Spearman correlation below threshold even after HPO.'}
+        else:
+            logger.info(f"✅ OPTIMIZATION SUCCESS: New Spearman={spearman_corr:.4f}")
 
     # =========================================================
     # STEP 3: EXTRACT FEATURE IMPORTANCE

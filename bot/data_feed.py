@@ -1,9 +1,11 @@
 import math
 import time
+import sqlite3
 import logging
 import pandas as pd
 from datetime import datetime, timezone
 from bot.config import AWS_BUCKET, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+from data_pipeline.database import DB_PATH
 
 logger = logging.getLogger()
 
@@ -81,8 +83,6 @@ class MarketData:
         """
         if use_db:
             try:
-                import sqlite3
-                from data_pipeline.database import DB_PATH
 
                 # Normalize symbol for DB query (e.g. BTC -> BTC/USDT)
                 if "/" not in coin and "-" not in coin:

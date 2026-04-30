@@ -2,21 +2,30 @@ import os
 import json
 import time
 import sqlite3
+import logging
 import pandas as pd
 import numpy as np
-import logging
+import lightgbm as lgb
+import xgboost as xgb
 from eth_account import Account
 from hyperliquid.info import Info
 from hyperliquid.exchange import Exchange
-
-from bot.config import *
-from bot.utils import S3Interface, StateManager, send_telegram_message, send_telegram_receipt
-from bot.data_feed import MarketData, AssetManager, fetch_daily_receipt
-from bot.indicators import get_local_poc, get_cvd_slope
-from bot.strategies import STRATEGY_CONFIG, SimpleBreakout
-from bot.risk_engine import RiskEngine
 from ta.momentum import RSIIndicator
 from ta.trend import MACD
+
+from bot.config import AWS_BUCKET, TESTNET_MODE, BASE_URL
+from bot.utils import S3Interface, send_telegram_message, send_telegram_receipt
+from bot.data_feed import AssetManager, fetch_daily_receipt
+from bot.indicators import get_local_poc, get_cvd_slope
+from bot.strategies import STRATEGY_CONFIG
+from bot.risk_engine import RiskEngine
+from data_pipeline.hyperliquid_sync import (
+    get_hl_top_by_volume, 
+    get_live_meta_ctx, 
+    get_latest_candles, 
+    get_bulk_latest_candles
+)
+from data_pipeline.database import DB_PATH
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 logger = logging.getLogger()
@@ -136,7 +145,7 @@ def executor_handler(event, context):
         risk = RiskEngine(exchange=exchange, info=info, account_address=ADDR, bucket=AWS_BUCKET)
         
         user_state = info.user_state(ADDR)
-        if not risk.check_safety(user_state): return {'statusCode': 400, 'body': 'Safety failed'}
+        if not risk.check_safety(): return {'statusCode': 400, 'body': 'Safety failed'}
         
         all_mids = info.all_mids()
         portfolio = risk.parse_portfolio(user_state, all_mids)
@@ -146,13 +155,10 @@ def executor_handler(event, context):
         risk.clean_global_zombies(portfolio, open_orders)
 
         # 2. 🌐 THE LIVE SNAPSHOT
-        from data_pipeline.hyperliquid_sync import get_hl_top_by_volume, get_live_meta_ctx, get_latest_candles, get_bulk_latest_candles
-        
         logger.info("📡 Pinging Hyperliquid for Top 50 assets & Live Meta Context...")
         top_50_symbols = get_hl_top_by_volume(50)
         live_ctx = get_live_meta_ctx()
         
-        from data_pipeline.database import DB_PATH
         db_conn = sqlite3.connect(DB_PATH)
         
         engine = LiveInferenceEngine(info, conn=db_conn)
@@ -204,30 +210,38 @@ def executor_handler(event, context):
         for col in continuous_features:
             mega_df[f'rank_{col}'] = mega_df[col].rank(pct=True)
 
-        # 5. 🤖 INFERENCE
+        # 5. 🤖 ENSEMBLE INFERENCE
         s3 = S3Interface(AWS_BUCKET)
-        model_path = '/tmp/cross_sectional_lgbm.txt'
+        lgb_path = '/tmp/cross_sectional_lgbm.txt'
+        xgb_path = '/tmp/cross_sectional_xgboost.json'
         
-        logger.info("🧠 Downloading LightGBM model from S3...")
-        success = s3.download_file('models/cross_sectional_lgbm.txt', model_path)
+        logger.info("🧠 Downloading Ensemble Models (LGBM + XGB) from S3...")
+        success_lgb = s3.download_file('models/cross_sectional_lgbm.txt', lgb_path)
+        success_xgb = s3.download_file('models/cross_sectional_xgboost.json', xgb_path)
         
         ml_success = False
-        if success:
+        if success_lgb and success_xgb:
             try:
-                import lightgbm as lgb
-                model = lgb.Booster(model_file=model_path)
+                # Load Models
+                model_lgb = lgb.Booster(model_file=lgb_path)
+                model_xgb = xgb.XGBRegressor()
+                model_xgb.load_model(xgb_path)
                 
+                # Prepare Features
                 feature_cols = ['rank_rsi', 'rank_macd', 'rank_volatility_20', 'rank_basis_pct', 'rank_oi_usd', 'rank_funding_rate', 'rank_sum_toptrader_long_short_ratio', 'rank_corr_to_index']
                 time_features = ['hour_sin', 'hour_cos', 'day_sin', 'day_cos']
                 strategy_cols = [col for col in mega_df.columns if col.startswith('sig_')]
                 X_live = mega_df[feature_cols + time_features + strategy_cols]
                 
-                mega_df['predicted_rank'] = model.predict(X_live)
+                # Combined Prediction
+                preds_lgb = model_lgb.predict(X_live)
+                preds_xgb = model_xgb.predict(X_live)
+                mega_df['predicted_rank'] = (preds_lgb + preds_xgb) / 2.0
+                
+                logger.info("✅ Ensemble Inference Complete.")
                 ml_success = True
-            except ImportError:
-                logger.warning("⚠️ lightgbm package not found. Skipping ML inference.")
             except Exception as e:
-                logger.error(f"⚠️ Error loading LightGBM model or predicting: {e}")
+                logger.error(f"⚠️ Ensemble Inference Failed: {e}")
                 
         if not ml_success:
             logger.warning("⚠️ Falling back to simple Momentum Rank (RSI + MACD).")

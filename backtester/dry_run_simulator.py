@@ -26,7 +26,6 @@ DEFAULT_TAKER_FEE = 0.00055   # Hyperliquid taker fee (0.055%)
 def simulate_portfolio(
     mega_df: pd.DataFrame,
     predictions: np.ndarray,
-    feature_names: list,
     top_n: int = 10,
     bottom_n: int = 10,
     rebalance_freq: int = 6,
@@ -46,8 +45,6 @@ def simulate_portfolio(
         and 'fwd_return' columns. Must be the OOS (out-of-sample) slice only.
     predictions : np.ndarray
         The model's predicted target_rank for each row in mega_df.
-    feature_names : list
-        List of feature column names used by the model (for importance).
     top_n : int
         Number of assets to go long (highest predicted rank).
     bottom_n : int
@@ -65,7 +62,7 @@ def simulate_portfolio(
         'sharpe', 'profit_factor', 'win_rate', 'total_return',
         'n_rebalances', 'avg_daily_return', 'max_drawdown',
         'equity_curve' (pd.Series), 'trade_log' (pd.DataFrame),
-        'top_assets' (list), 'bottom_assets' (list)
+        'top_assets' (list), 'bottom_assets' (list), 'mc_stats' (dict)
     """
     df = mega_df.copy()
     df['predicted_rank'] = predictions

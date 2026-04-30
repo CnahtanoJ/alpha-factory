@@ -313,7 +313,6 @@ class SyncManager:
           1. Bulk download from Binance Vision (free, fast)
           2. Fill remaining gaps from exchange API (unless skip_exchange=True)
         """
-        import time
         start_time = time.time()
         
         print(f"\n{'='*60}")
