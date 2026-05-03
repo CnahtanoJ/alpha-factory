@@ -51,25 +51,52 @@ graph TD
 
 ---
 
-## Quick Start
+## Master CLI Reference (`master.py`)
 
+The `master.py` script is the single entry point for all operations.
+
+### `ingest` - Historical Data Pipeline
+Downloads historical ZIPs from Binance Vision, patches gaps, and audits the result.
 ```bash
-# 1. Environment
-python -m venv .venv && .venv\Scripts\activate
-pip install -r requirements.txt
-
-# 2. Ingest historical data (Top 100 HL assets from Binance Vision)
-#    This automatically runs: Bulk Sync → Gap Patcher → Data Auditor
+# Ingest the Top 100 Hyperliquid coins with default timeframes (15m, 1h, 4h)
 python master.py ingest --top 100
 
-# 3. Check what you have
-python master.py status
+# Ingest specific symbols with custom timeframes
+python master.py ingest --symbols BTC/USDT,ETH/USDT --timeframe 1h,4h --years 4
+```
 
-# 4. Run the full weekly cycle (Train LightGBM → OOS Simulate → Report)
+### `full` - End-to-End Research Cycle
+Runs the complete intelligence cycle: [Optional Ingest] → Train Model → OOS Simulation → Generate AI Report.
+```bash
+# Standard Weekly Run (Train & Report on existing Futures data)
 python master.py full --market futures
 
-# 5. Verify database health
+# Bootstrap Run (Download Top 100 FIRST, then Train & Report)
+python master.py full --top 100 --market futures
+
+# Power User Flags
+python master.py full --market futures --force          # Force retraining (ignores cached model)
+python master.py full --market futures --dry-run-weeks 8  # Simulate 8 weeks of Out-Of-Sample trading
+```
+
+### `report` - Generate Intelligence Report Only
+Runs the OOS simulator using an already cached model and generates the Weekly Intelligence Report.
+```bash
+python master.py report --market futures
+python master.py report --market futures --dry-run-weeks 4
+```
+
+### `audit` - Standalone Data Auditor
+Scans the database for gaps, spikes, and missing tokens, generating a health report card (A+ to F).
+```bash
 python master.py audit --market futures
+python master.py audit --market futures --symbols BTC/USDT
+```
+
+### `status` - Database Overview
+Quickly prints the row counts and date ranges of all tables in the SQLite database.
+```bash
+python master.py status
 ```
 
 ---
