@@ -25,11 +25,9 @@ downloads/
 *.zip
 *.csv
 *.json
-!elite_squad.json
-!champion_blueprint.json
-!all_grid_results.json
-!analytics/models/*.json
-!analytics/models/*.pkl
+*.txt
+!requirements.txt
+!analytics/models/best_params.json
 
 # Reports
 reports/
