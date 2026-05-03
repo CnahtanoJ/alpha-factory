@@ -32,7 +32,7 @@ downloads/
 !analytics/models/*.pkl
 
 # Reports
-weekly_intelligence_report.md
+reports/
 
 # IDEs
 .vscode/
