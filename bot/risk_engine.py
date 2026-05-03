@@ -260,7 +260,11 @@ class RiskEngine:
         if pos_details:
             pos_size = float(pos_details.get('szi', 0.0))
             avg_entry_px = float(pos_details.get('entryPx', 0.0))
-            current_count = int(round(abs(pos_size) / base_sz_unit)) if base_sz_unit > 0 else 1
+            
+            # P3-1: Use actual entry price to reconstruct the original layer size
+            # Prevents DCA inflation if the token pumped significantly since entry
+            original_base_unit = entry_usd / avg_entry_px if avg_entry_px > 0 else base_sz_unit
+            current_count = int(round(abs(pos_size) / original_base_unit)) if original_base_unit > 0 else 1
         else:
             pos_size = 0.0
             avg_entry_px = 0.0
@@ -465,6 +469,12 @@ class RiskEngine:
 
         sz_raw = float(pos_details['szi'])
         total_sz = abs(sz_raw)
+        
+        # P3-2: Failsafe against Dust - If total size is unmanageable, abort completely.
+        if self.assets.round_size(coin, total_sz) <= 0:
+            logger.warning(f"⚠️ {coin} position size {total_sz} is dust. Skipping Unified Orders.")
+            return
+            
         avg_entry = float(pos_details['entryPx'])
         is_buy_pos = sz_raw > 0
         
@@ -564,7 +574,7 @@ class RiskEngine:
             o for o in open_orders 
             if o['coin'] == coin 
             and o['isTrigger'] == True
-            and "stop" in o['orderType'].lower()
+            and "stop" in str(o.get('orderType', '')).lower()
         ), None)
 
         # IF NAKED -> RESET EVERYTHING
@@ -619,7 +629,7 @@ class RiskEngine:
                 # A. Find Existing SL (Avoid Duplicates)
                 existing_sl = next((
                     o for o in open_orders 
-                    if o['coin'] == coin and o['isTrigger'] and "stop" in o['orderType'].lower()
+                    if o['coin'] == coin and o['isTrigger'] and "stop" in str(o.get('orderType', '')).lower()
                 ), None)
 
                 # If SL is ALREADY at Breakeven (Tolerance 0.2%)

@@ -293,6 +293,7 @@ def _empty_result():
         'trade_log': pd.DataFrame(),
         'top_assets': [],
         'bottom_assets': [],
+        'mc_stats': {'prob_profit': 0, 'ci_lower': 0, 'ci_upper': 0, 'mean_return': 0, 'sims': 0},
     }
 
 

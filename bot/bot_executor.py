@@ -25,7 +25,7 @@ from data_pipeline.hyperliquid_sync import (
     get_latest_candles, 
     get_bulk_latest_candles
 )
-from data_pipeline.database import DB_PATH
+from data_pipeline.database import DB_PATH, get_connection
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 logger = logging.getLogger()
@@ -40,7 +40,7 @@ class LiveInferenceEngine:
         if not candles: return None
         df = pd.DataFrame(candles)
         # candles have t, o, h, l, c, v
-        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms').dt.floor('S')
         df = df.sort_values('timestamp').reset_index(drop=True)
         
         if index_df is not None and not index_df.empty:
@@ -57,7 +57,7 @@ class LiveInferenceEngine:
                 idx_q = "SELECT timestamp as idx_ts, close as index_close FROM index_ohlcv WHERE symbol = ? ORDER BY timestamp DESC LIMIT 100"
                 idx_df = pd.read_sql_query(idx_q, self.conn, params=(symbol,))
                 if not idx_df.empty:
-                    idx_df['idx_ts'] = pd.to_datetime(idx_df['idx_ts'], unit='ms')
+                    idx_df['idx_ts'] = pd.to_datetime(idx_df['idx_ts'], unit='ms').dt.floor('S')
                     df = pd.merge_asof(df, idx_df, left_on='timestamp', right_on='idx_ts', direction='backward')
             except Exception as e:
                 logger.warning(f"⚠️ Could not fetch historical index data for {symbol}: {e}")
@@ -159,7 +159,7 @@ def executor_handler(event, context):
         top_50_symbols = get_hl_top_by_volume(50)
         live_ctx = get_live_meta_ctx()
         
-        db_conn = sqlite3.connect(DB_PATH)
+        db_conn = get_connection()
         
         engine = LiveInferenceEngine(info, conn=db_conn)
         live_rows = []
@@ -283,7 +283,8 @@ def executor_handler(event, context):
         if not target_rows.empty:
             # A. Calculate Risk Parity Weights
             # Weight = (1/ATR) / sum(1/ATR)
-            target_rows['inv_vol'] = 1.0 / (target_rows['atr_pct'] + 1e-6)
+            # P3-3: Failsafe against NaN/Zero ATR preventing all execution
+            target_rows['inv_vol'] = 1.0 / (target_rows['atr_pct'].fillna(0.001).clip(lower=0.001))
             total_inv_vol = target_rows['inv_vol'].sum()
             target_rows['rp_weight'] = target_rows['inv_vol'] / total_inv_vol
             
@@ -305,7 +306,8 @@ def executor_handler(event, context):
                     is_buy = (signal == "BULLISH")
                     current_price = float(all_mids[target_coin])
                     coin_candles = bulk_candles.get(target_coin, [])
-                    poc_price = get_local_poc(coin_candles)
+                    # C-5 FIX: get_local_poc expects a DataFrame, not a list of dicts
+                    poc_price = get_local_poc(pd.DataFrame(coin_candles)) if coin_candles else 0.0
                     
                     if risk.check_execution_safety(target_coin, is_buy, current_price, poc_price):
                         logger.info(f"🚀 BASKET ENTRY: {signal} {target_coin}")

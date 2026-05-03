@@ -122,11 +122,27 @@ def cmd_ingest(args):
         print(f"  INGESTING: {len(symbols)} symbols | {tf} | {market}")
         print(f"{'='*60}")
         sync.bulk_sync(symbols, timeframe=tf, market=market, 
-                       target_years=args.years, start_year=args.start_year,
-                       skip_exchange=args.no_gap_fill)
+                       target_years=args.years, start_year=args.start_year)
     
     sync.close()
-    print("\n✅ Data ingestion complete!")
+    
+    # Automate Gap Patcher
+    print("\n" + "="*60)
+    print("  🩹 UNIVERSAL GAP PATCHER")
+    print("="*60)
+    from data_pipeline.universal_gap_patcher import UniversalGapPatcher
+    patcher = UniversalGapPatcher()
+    patcher.patch_ohlcv(dry_run=False)
+    patcher.patch_index_ohlcv(dry_run=False)
+    patcher.patch_symbol_metrics(dry_run=False)
+    patcher.patch_funding_rate(dry_run=False)
+    patcher.close()
+    
+    # Automate Auditor
+    args.market = market
+    cmd_audit(args)
+    
+    print("\n✅ Full Data Ingestion, Patching, and Auditing Complete!")
 
 
 def cmd_report(args):
@@ -161,7 +177,6 @@ def cmd_full(args):
         print("\n" + "="*60)
         print("  📥 STEP 0: BOOTSTRAP INGESTION")
         print("="*60)
-        args.no_gap_fill = False  # Full cycle always gap-fills
         cmd_ingest(args)
     
     # 1. 🔄 SMART SYNC: Freshness Mode
@@ -330,14 +345,12 @@ Recommended first-time workflow:
                           help='Comma-separated symbols (default: BTC,ETH,SOL)')
     p_ingest.add_argument('--top', type=int, default=0,
                           help='Auto-discover top N symbols by volume (overrides --symbols)')
-    p_ingest.add_argument('--timeframe', default='1h', 
-                          help='Comma-separated timeframes (default: 1h)')
+    p_ingest.add_argument('--timeframe', default='15m,1h,4h', 
+                          help='Comma-separated timeframes (default: 15m,1h,4h)')
     p_ingest.add_argument('--years', type=int, default=3, 
                           help='Target years of history (default: 3)')
     p_ingest.add_argument('--start-year', type=int, default=2020, dest='start_year',
                           help='Start year for Binance Vision download (default: 2020)')
-    p_ingest.add_argument('--no-gap-fill', action='store_true', dest='no_gap_fill',
-                          help='Skip CCXT exchange API gap-filling (Binance Vision only)')
     p_ingest.set_defaults(func=cmd_ingest)
     
     # Common ML Arguments
@@ -362,8 +375,8 @@ Recommended first-time workflow:
                           help='Symbols to ingest if bootstrapping')
     p_full.add_argument('--top', type=int, default=0,
                           help='Auto-discover top N symbols to bootstrap')
-    p_full.add_argument('--timeframe', default='1h', 
-                          help='Timeframes to ingest (default: 1h)')
+    p_full.add_argument('--timeframe', default='15m,1h,4h', 
+                          help='Timeframes to ingest (default: 15m,1h,4h)')
     p_full.add_argument('--years', type=int, default=3, 
                           help='Years of history to fetch (default: 3)')
     p_full.add_argument('--start-year', type=int, default=2020, dest='start_year',

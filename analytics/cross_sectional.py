@@ -7,6 +7,7 @@ import numpy as np
 import lightgbm as lgb
 import xgboost as xgb
 import optuna
+import gc
 from scipy.stats import spearmanr
 from ta.momentum import RSIIndicator
 from ta.trend import MACD
@@ -27,35 +28,41 @@ def fetch_and_merge_symbol_data(symbol, conn, timeframe='15m'):
     # 1. Fetch OHLCV
     df = pd.read_sql_query("SELECT * FROM ohlcv WHERE symbol = ? AND timeframe = ? ORDER BY timestamp", conn, params=(symbol, timeframe))
     if df.empty: return pd.DataFrame()
-    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms').dt.floor('S')
 
-    # 2. Fetch Index OHLCV
-    idx_df = pd.read_sql_query("SELECT timestamp as idx_ts, close as index_close FROM index_ohlcv WHERE symbol = ? ORDER BY timestamp", conn, params=(symbol,))
+    # 2. Fetch Index OHLCV (M-1 FIX: filter by timeframe to avoid cross-timeframe pollution)
+    idx_df = pd.read_sql_query("SELECT timestamp as idx_ts, close as index_close FROM index_ohlcv WHERE symbol = ? AND timeframe = ? ORDER BY timestamp", conn, params=(symbol, timeframe))
     if not idx_df.empty:
-        idx_df['idx_ts'] = pd.to_datetime(idx_df['idx_ts'], unit='ms')
-        df = pd.merge_asof(df, idx_df, left_on='timestamp', right_on='idx_ts', direction='backward')
+        idx_df['idx_ts'] = pd.to_datetime(idx_df['idx_ts'], unit='ms').dt.floor('S')
+        df = pd.merge_asof(df, idx_df, left_on='timestamp', right_on='idx_ts', direction='backward', tolerance=pd.Timedelta(hours=2))
     else:
         df['index_close'] = df['close'] # Fallback
 
-    # 3. Fetch Symbol Metrics
-    metrics_df = pd.read_sql_query("SELECT timestamp as met_ts, sum_open_interest, sum_toptrader_long_short_ratio FROM symbol_metrics WHERE symbol = ? ORDER BY timestamp", conn, params=(symbol,))
+    # 3. Fetch Symbol Metrics (C-4 FIX: fetch sum_open_interest_value which is already in USD)
+    metrics_df = pd.read_sql_query("SELECT timestamp as met_ts, sum_open_interest, sum_open_interest_value, sum_toptrader_long_short_ratio FROM symbol_metrics WHERE symbol = ? ORDER BY timestamp", conn, params=(symbol,))
     if not metrics_df.empty:
-        metrics_df['met_ts'] = pd.to_datetime(metrics_df['met_ts'], unit='ms')
-        df = pd.merge_asof(df, metrics_df, left_on='timestamp', right_on='met_ts', direction='backward')
+        metrics_df['met_ts'] = pd.to_datetime(metrics_df['met_ts'], unit='ms').dt.floor('S')
+        df = pd.merge_asof(df, metrics_df, left_on='timestamp', right_on='met_ts', direction='backward', tolerance=pd.Timedelta(hours=2))
     else:
         df['sum_open_interest'] = np.nan
+        df['sum_open_interest_value'] = np.nan
         df['sum_toptrader_long_short_ratio'] = np.nan
 
     # 4. Fetch Funding Rate
     fund_df = pd.read_sql_query("SELECT calc_time, last_funding_rate FROM funding_rate WHERE symbol = ? ORDER BY calc_time", conn, params=(symbol,))
     if not fund_df.empty:
-        fund_df['calc_time'] = pd.to_datetime(fund_df['calc_time'], unit='ms')
-        df = pd.merge_asof(df, fund_df, left_on='timestamp', right_on='calc_time', direction='backward')
+        fund_df['calc_time'] = pd.to_datetime(fund_df['calc_time'], unit='ms').dt.floor('S')
+        df = pd.merge_asof(df, fund_df, left_on='timestamp', right_on='calc_time', direction='backward', tolerance=pd.Timedelta(hours=16))
     else:
         df['last_funding_rate'] = np.nan
 
-    # Forward fill the lower frequency data (metrics, funding) that might have been NaN before their first timestamp
-    df = df.ffill()
+    # C-3 FIX: Bounded forward fill — propagate lower-frequency data (metrics/funding)
+    # within a safe window, but never across unfillable gaps
+    fill_cols = ['index_close', 'sum_open_interest', 'sum_open_interest_value', 'sum_toptrader_long_short_ratio', 'last_funding_rate']
+    for col in fill_cols:
+        if col in df.columns:
+            df[col] = df[col].ffill(limit=8)  # Max 8 periods (2h for 15m candles)
+    
     df['symbol'] = symbol
     return df
 
@@ -72,9 +79,19 @@ def add_time_series_features(df, btc_df=None):
     
     df['volatility_20'] = df['close'].rolling(window=20).std()
     
+    # C-1 FIX: Add ATR% for backtester risk_parity weighting
+    tr = pd.concat([
+        df['high'] - df['low'],
+        (df['high'] - df['close'].shift(1)).abs(),
+        (df['low'] - df['close'].shift(1)).abs()
+    ], axis=1).max(axis=1)
+    df['atr_pct'] = tr.rolling(14).mean() / df['close']
+    
     # Derivative Fuel
     df['basis_pct'] = (df['close'] - df['index_close']) / df['index_close']
-    df['oi_usd'] = df['sum_open_interest'] * df['close']
+    # C-4 FIX: Use sum_open_interest_value (already in USD from Binance) to match
+    # Hyperliquid's openInterest * oraclePx calculation in live inference
+    df['oi_usd'] = df.get('sum_open_interest_value', df.get('sum_open_interest', np.nan) * df['close'])
     df['funding_rate'] = df['last_funding_rate']
     
     # Market Correlation (Fixed to use BTC like Phase 2)
@@ -96,7 +113,16 @@ def add_time_series_features(df, btc_df=None):
     # Forward Return (Target Calculation)
     # Default: 6 bars (1.5h for 15m candles, 6h for 1h candles)
     FWD_RETURN_BARS = 6
-    df['fwd_return'] = df['close'].shift(-FWD_RETURN_BARS) / df['close'] - 1
+    
+    # Safely compute fwd_return avoiding gaps
+    tf_timedelta = df['timestamp'].diff().mode()[0]
+    expected_delta = tf_timedelta * FWD_RETURN_BARS
+    
+    shifted_close = df['close'].shift(-FWD_RETURN_BARS)
+    shifted_ts = df['timestamp'].shift(-FWD_RETURN_BARS)
+    
+    valid_mask = (shifted_ts - df['timestamp']) == expected_delta
+    df['fwd_return'] = np.where(valid_mask, shifted_close / df['close'] - 1, np.nan)
 
     # Strategy Loop
     # Setting use_htf=False since we don't have htf_trend calculated yet
@@ -132,7 +158,21 @@ def build_mega_dataframe(timeframe='15m'):
         df = fetch_and_merge_symbol_data(sym, conn, timeframe=timeframe)
         if df.empty: continue
         df = add_time_series_features(df, btc_df)
-        all_dfs.append(df)
+        
+        # P3-4: Extreme Memory Optimization (16GB RAM Target)
+        # 1. Early Drop: Remove useless rows before they enter the mega list
+        df = df.dropna(subset=['fwd_return', 'rsi'])
+        
+        # 2. Downcast: Cut numerical memory in half (Float64 -> Float32)
+        for col in df.select_dtypes(include=['float64']).columns:
+            df[col] = df[col].astype(np.float32)
+        for col in df.select_dtypes(include=['int64']).columns:
+            # Keep timestamp as int64 to avoid overflow
+            if col != 'timestamp':
+                df[col] = df[col].astype(np.int32)
+                
+        if not df.empty:
+            all_dfs.append(df)
         
     conn.close()
     
@@ -141,6 +181,11 @@ def build_mega_dataframe(timeframe='15m'):
         return pd.DataFrame()
         
     mega_df = pd.concat(all_dfs, ignore_index=True)
+    
+    # P3-5: Explicit Garbage Collection
+    print(f"Mega-DataFrame constructed: {len(mega_df)} rows. Purging intermediate memory...")
+    del all_dfs
+    gc.collect()
     
     # Cross-Sectional Ranking
     print("Applying cross-sectional ranking...")

@@ -35,7 +35,13 @@ class BinanceVision:
 
     def _get_url(self, symbol, timeframe, year, month=None, daily_date=None, data_type='klines'):
         """Constructs the Binance Vision URL for monthly or daily data."""
-        clean_symbol = symbol.replace("/", "").replace("-", "").upper()
+        clean_symbol = symbol.replace("/", "").replace("-", "")
+        
+        # Map Hyperliquid 'k' prefix (kPEPE) to Binance '1000' prefix (1000PEPE)
+        if clean_symbol.startswith('k') and len(clean_symbol) > 1 and clean_symbol[1].isupper():
+            clean_symbol = "1000" + clean_symbol[1:]
+            
+        clean_symbol = clean_symbol.upper()
         
         # Metrics and IndexPriceKlines have different folder structures
         if data_type == 'metrics':

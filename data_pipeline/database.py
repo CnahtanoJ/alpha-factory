@@ -91,17 +91,6 @@ def init_db():
         )
     ''')
     
-    # Blueprints Table: Stores the "Winning" strategies
-    conn.execute("""
-    CREATE TABLE IF NOT EXISTS blueprints (
-        id TEXT PRIMARY KEY,
-        created_at TEXT,
-        config_json TEXT,
-        performance_metrics TEXT,
-        is_active INTEGER DEFAULT 0
-    )
-    """)
-    
     conn.commit()
     conn.close()
 

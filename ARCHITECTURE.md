@@ -58,8 +58,9 @@ graph TD
 python -m venv .venv && .venv\Scripts\activate
 pip install -r requirements.txt
 
-# 2. Ingest historical data (Top 100 HL assets from Binance Vision + API gap-fill)
-python master.py ingest --top 100 --timeframe 1h
+# 2. Ingest historical data (Top 100 HL assets from Binance Vision)
+#    This automatically runs: Bulk Sync → Gap Patcher → Data Auditor
+python master.py ingest --top 100
 
 # 3. Check what you have
 python master.py status
@@ -82,13 +83,12 @@ asset-analysis/
 ├── .env                             # API keys, Telegram creds, DB path override
 │
 ├── data_pipeline/                   # Data Foundation
-│   ├── database.py                  #   Schema: ohlcv, index_ohlcv, symbol_metrics, funding_rate, sync_state
-│   ├── sync_manager.py              #   Binance Vision → CCXT gap-fill orchestration (all data types)
+│   ├── database.py                  #   Schema: ohlcv, index_ohlcv, symbol_metrics, funding_rate, sync_state, unfillable_gaps
+│   ├── sync_manager.py              #   Binance Vision bulk download orchestration (all data types)
 │   ├── binance_vision.py            #   Monthly ZIP + Daily Bridge downloads (klines, index, metrics, funding)
-│   ├── data_fetcher.py              #   CCXT exchange wrapper, top-N volume discovery
+│   ├── universal_gap_patcher.py     #   Stateful gap patching with unfillable gap tracking
 │   ├── hyperliquid_sync.py          #   HL universe listing, top-N by volume, live klines, live meta context
-│   ├── data_auditor.py              #   Non-destructive gap/spike/health grading (A+ → F)
-│   └── source_scrubber.py           #   Purge & restore recent candles from pure Binance
+│   └── data_auditor.py              #   Non-destructive gap/spike/health grading (A+ → F) with unfillable gap forgiveness
 │
 ├── analytics/                       # AI & Intelligence
 │   ├── cross_sectional.py           #   LightGBM cross-sectional ranking model (training + S3 export)
@@ -120,24 +120,26 @@ asset-analysis/
 
 The canonical ingestion command is:
 ```bash
-python master.py ingest --top 100 --timeframe 1h
+python master.py ingest --top 100
 ```
+Default timeframes: `15m, 1h, 4h`.
 
-This triggers:
+This triggers the **God Mode Pipeline** (fully automated):
 1. **Symbol Discovery**: `hyperliquid_sync.get_hl_top_by_volume(100)` → Top 100 HL perps by 24h volume.
 2. **Binance Vision Download** (per symbol): `sync_manager.sync_from_binance_vision()` fetches 4 data types:
    - `klines` → `ohlcv` table
    - `indexPriceKlines` → `index_ohlcv` table
    - `metrics` (OI, long/short ratios) → `symbol_metrics` table
    - `fundingRate` → `funding_rate` table
-3. **CCXT Gap Fill**: `sync_manager.sync_from_exchange()` fills forward/backward gaps via Binance REST API.
+3. **Universal Gap Patcher**: `universal_gap_patcher.py` scans for temporal gaps, fetches daily ZIPs to fill them, and permanently blacklists confirmed empty archives in the `unfillable_gaps` table.
+4. **Data Auditor**: Prints a final health report card (Grade A+ → F) for every partition, forgiving unfillable gaps.
 
 ### Ingestion Sources
 
 | Source | File | Purpose |
 |:--|:--|:--|
 | **Binance Vision** | `binance_vision.py` | Free public CSV archives. Monthly ZIPs + **Daily Bridge** for current month (zero-gap). Supports klines, indexPriceKlines, metrics, and fundingRate. |
-| **Binance REST API** | `data_fetcher.py` | CCXT-based gap-filling. Also discovers top-N symbols by 24h volume. |
+| **Gap Patcher** | `universal_gap_patcher.py` | Fetches daily ZIPs for missing periods. Tracks unfillable gaps in SQLite. |
 | **Live Edge Sync** | `master.py cmd_sync_live` | Fetches latest 100 candles from Binance API for all DB symbols. |
 
 ### Hyperliquid Integration (Execution Only)
@@ -157,7 +159,7 @@ This triggers:
 | `symbol_metrics` | OI, long/short ratios | `(symbol, timestamp)` |
 | `funding_rate` | Funding rate history | `(symbol, calc_time)` |
 | `sync_state` | Resume-point tracker per partition | `(symbol, timeframe, market, data_type)` |
-| `blueprints` | Archived winning strategy configs | `id` |
+| `unfillable_gaps` | Confirmed empty Binance archives (blacklist) | `(table_name, symbol, timeframe, start_ts, end_ts)` |
 
 Uses **WAL** journal mode with tuned cache for concurrent read performance.
 
@@ -165,12 +167,9 @@ Uses **WAL** journal mode with tuned cache for concurrent read performance.
 
 `data_auditor.py` provides **non-destructive** health checks:
 - **Gap Detection**: Identifies missing candles via timestamp diff analysis.
+- **Unfillable Gap Forgiveness**: Queries `unfillable_gaps` table and subtracts confirmed missing durations from the penalty.
 - **Spike Detection**: Flags candles with >20% open→close moves.
-- **Health Grading**: A+ (≥95%) through F (<50%), factoring gap density.
-
-`source_scrubber.py` provides **destructive** restoration:
-- Deletes the most recent N candles per partition (potential contamination zone).
-- Triggers `SyncManager` to backfill from pure Binance sources.
+- **Health Grading**: A+ (≥98%) through F (<50%), based on missing data ratio and anomaly count.
 
 ---
 
@@ -367,9 +366,9 @@ All strategies implement `VectorStrategy.get_signal_column(df) → Series[0, 1, 
 
 | Command | Key Flags | Description |
 |:--|:--|:--|
-| `ingest` | `--top 100`, `--timeframe 1h,15m` | Historical ingest via Binance Vision + CCXT. HL top-N discovery with `--top`. |
+| `ingest` | `--top 100`, `--timeframe 15m,1h,4h` | Automated pipeline: Binance Vision download → Gap Patcher → Data Auditor. |
 | `status` | — | Database health: row counts, date ranges, file size. |
-| `audit` | `--market futures`, `--symbols BTC/USDT` | Non-destructive gap/spike analysis with A→F grading. |
+| `audit` | `--market futures`, `--symbols BTC/USDT` | Non-destructive gap/spike analysis with A→F grading (unfillable gap aware). |
 
 ### Intelligence Commands
 
@@ -398,7 +397,7 @@ All strategies implement `VectorStrategy.get_signal_column(df) → Series[0, 1, 
 ```
 Binance Vision (Monthly + Daily ZIPs)
   → klines, indexPriceKlines, metrics, fundingRate
-Binance REST API (Live Edge, CCXT Gap Fill)
+Universal Gap Patcher (Daily ZIPs + Unfillable Blacklist)
         │
         ▼
    alpha_factory.db (Local SQLite, WAL mode)
