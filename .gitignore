@@ -26,6 +26,7 @@ downloads/
 *.csv
 *.json
 *.txt
+*.pkl
 !requirements.txt
 !analytics/models/best_params.json
 
