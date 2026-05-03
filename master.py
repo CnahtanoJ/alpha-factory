@@ -28,73 +28,6 @@ from datetime import datetime
 # Ensure project root is in path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-def cmd_sync_live(args):
-    """Fetch the latest 100 candles for active universe from Binance API (Pure Binance policy)."""
-    print(f"\n🔄 Running Live Edge Sync (Binance Only)...")
-    import requests
-    import time
-    
-    from data_pipeline.database import DB_PATH
-    conn = sqlite3.connect(DB_PATH)
-    pairs_to_refresh = conn.execute("SELECT DISTINCT symbol, market FROM ohlcv").fetchall()
-    conn.close()
-    
-    if not pairs_to_refresh:
-        print("   ⚠️ No data found in DB. Ingest some historical data first.")
-        return
-
-    tf_arg = args.timeframe if hasattr(args, 'timeframe') else '1h'
-    timeframes = [t.strip() for t in tf_arg.split(',')]
-    
-    sync_count = 0
-    for current_tf in timeframes:
-        print(f"   🔄 Syncing {current_tf} edge...")
-        for symbol, market in pairs_to_refresh:
-            candles = []
-            binance_symbol = symbol.replace('/', '').replace('-', '') # e.g. BTC/USDT -> BTCUSDT
-            
-            # Map Hyperliquid 'k' prefix (kPEPE) to Binance '1000' prefix (1000PEPE)
-            if binance_symbol.startswith('k') and len(binance_symbol) > 1 and binance_symbol[1].isupper():
-                binance_symbol = "1000" + binance_symbol[1:]
-            
-            if not binance_symbol.endswith("USDT"):
-                binance_symbol += "USDT"
-            try:
-                if market == 'futures':
-                    url = "https://fapi.binance.com/fapi/v1/klines"
-                else:
-                    url = "https://api.binance.com/api/v3/klines"
-                
-                params = {'symbol': binance_symbol, 'interval': current_tf, 'limit': 100}
-                res = requests.get(url, params=params, timeout=10)
-                if res.status_code == 200:
-                    data = res.json()
-                    for c in data:
-                        candles.append({
-                            'timestamp': c[0], 'open': float(c[1]), 'high': float(c[2]),
-                            'low': float(c[3]), 'close': float(c[4]), 'volume': float(c[5]),
-                            'symbol': symbol, 'timeframe': current_tf, 'market': market
-                        })
-            except Exception as e:
-                print(f"   ❌ Binance API failed for {symbol}: {e}")
-
-            # Bulk upsert into DB
-            if candles:
-                conn = sqlite3.connect(DB_PATH)
-                cursor = conn.cursor()
-                cursor.executemany("""
-                    INSERT OR REPLACE INTO ohlcv (timestamp, symbol, timeframe, market, open, high, low, close, volume)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, [(c['timestamp'], c['symbol'], c['timeframe'], c['market'], c['open'], c['high'], c['low'], c['close'], c['volume']) for c in candles])
-                conn.commit()
-                conn.close()
-                sync_count += 1
-
-            time.sleep(0.1)  # Rate limit courtesy
-            
-    print(f"   ✅ Refreshed {sync_count} symbols with live Binance edge data.")
-
-
 def cmd_ingest(args):
     """Step 1: Download historical data into alpha_factory.db"""
     from data_pipeline.database import init_db
@@ -146,10 +79,9 @@ def cmd_ingest(args):
 
 
 def cmd_report(args):
-    """Run the Weekly Intelligence Cycle: Sync → OOS Simulate → Train → Report"""
-    # Auto-sync live edge before report
-    cmd_sync_live(args)
+    """Run the Weekly Intelligence Cycle: OOS Simulate → Train → Report"""
     
+
     from analytics.weekly_orchestrator import run_weekly_cycle
     from analytics.generate_report import generate_report
     
@@ -158,6 +90,8 @@ def cmd_report(args):
         market=args.market,
         force_train=args.force_train,
         dry_run_weeks=args.dry_run_weeks,
+        optimize=getattr(args, 'optimize', False),
+        n_trials=getattr(args, 'trials', 50)
     )
     
     print("\n📊 Generating Weekly Intelligence Report...")
@@ -178,10 +112,7 @@ def cmd_full(args):
         print("  📥 STEP 0: BOOTSTRAP INGESTION")
         print("="*60)
         cmd_ingest(args)
-    
-    # 1. 🔄 SMART SYNC: Freshness Mode
-    cmd_sync_live(args)
-    
+        
     print("\n" + "="*60)
     print("  🚀 STARTING FULL WEEKLY CYCLE")
     if args.force_train:
@@ -193,6 +124,8 @@ def cmd_full(args):
         market=args.market,
         force_train=args.force_train,
         dry_run_weeks=args.dry_run_weeks,
+        optimize=getattr(args, 'optimize', False),
+        n_trials=getattr(args, 'trials', 50)
     )
     
     sim = cycle_results.get('simulation_results')
@@ -361,6 +294,10 @@ Recommended first-time workflow:
                        help='Force retraining the model even if a cached version exists')
         p.add_argument('--dry-run-weeks', type=int, default=4, dest='dry_run_weeks',
                        help='Number of weeks to simulate in OOS dry run (default: 4)')
+        p.add_argument('--optimize', action='store_true', dest='optimize',
+                       help='Run Optuna Hyperparameter Optimization before training')
+        p.add_argument('--trials', type=int, default=50, dest='trials',
+                       help='Number of Optuna trials to run if --optimize is set (default: 50)')
 
     # ── report ──
     p_report = subparsers.add_parser('report', help='Run intelligence cycle + generate report')

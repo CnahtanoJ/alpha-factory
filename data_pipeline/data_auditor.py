@@ -133,7 +133,7 @@ class DataAuditor:
         expected_delta = self.tf_ms_map.get(timeframe)
         if expected_delta:
             diffs = df['timestamp'].diff()
-            gaps = diffs[diffs > expected_delta]
+            gaps = diffs[diffs > expected_delta * 1.5]
             
             if not gaps.empty:
                 results["gaps_found"] = len(gaps)

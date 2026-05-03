@@ -20,6 +20,9 @@ try:
 except ImportError:
     boto3 = None
     AWS_BUCKET = None
+
+MODEL_DIR = os.path.join(os.path.dirname(__file__), 'models')
+PARAMS_PATH = os.path.join(MODEL_DIR, 'best_params.json')
 def fetch_and_merge_symbol_data(symbol, conn, timeframe='15m'):
     """
     Fetches ohlcv, index_ohlcv, symbol_metrics, and funding_rate for a single symbol
@@ -28,12 +31,12 @@ def fetch_and_merge_symbol_data(symbol, conn, timeframe='15m'):
     # 1. Fetch OHLCV
     df = pd.read_sql_query("SELECT * FROM ohlcv WHERE symbol = ? AND timeframe = ? ORDER BY timestamp", conn, params=(symbol, timeframe))
     if df.empty: return pd.DataFrame()
-    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms').dt.floor('S')
+    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms').dt.floor('s')
 
     # 2. Fetch Index OHLCV (M-1 FIX: filter by timeframe to avoid cross-timeframe pollution)
     idx_df = pd.read_sql_query("SELECT timestamp as idx_ts, close as index_close FROM index_ohlcv WHERE symbol = ? AND timeframe = ? ORDER BY timestamp", conn, params=(symbol, timeframe))
     if not idx_df.empty:
-        idx_df['idx_ts'] = pd.to_datetime(idx_df['idx_ts'], unit='ms').dt.floor('S')
+        idx_df['idx_ts'] = pd.to_datetime(idx_df['idx_ts'], unit='ms').dt.floor('s')
         df = pd.merge_asof(df, idx_df, left_on='timestamp', right_on='idx_ts', direction='backward', tolerance=pd.Timedelta(hours=2))
     else:
         df['index_close'] = df['close'] # Fallback
@@ -41,7 +44,7 @@ def fetch_and_merge_symbol_data(symbol, conn, timeframe='15m'):
     # 3. Fetch Symbol Metrics (C-4 FIX: fetch sum_open_interest_value which is already in USD)
     metrics_df = pd.read_sql_query("SELECT timestamp as met_ts, sum_open_interest, sum_open_interest_value, sum_toptrader_long_short_ratio FROM symbol_metrics WHERE symbol = ? ORDER BY timestamp", conn, params=(symbol,))
     if not metrics_df.empty:
-        metrics_df['met_ts'] = pd.to_datetime(metrics_df['met_ts'], unit='ms').dt.floor('S')
+        metrics_df['met_ts'] = pd.to_datetime(metrics_df['met_ts'], unit='ms').dt.floor('s')
         df = pd.merge_asof(df, metrics_df, left_on='timestamp', right_on='met_ts', direction='backward', tolerance=pd.Timedelta(hours=2))
     else:
         df['sum_open_interest'] = np.nan
@@ -51,7 +54,7 @@ def fetch_and_merge_symbol_data(symbol, conn, timeframe='15m'):
     # 4. Fetch Funding Rate
     fund_df = pd.read_sql_query("SELECT calc_time, last_funding_rate FROM funding_rate WHERE symbol = ? ORDER BY calc_time", conn, params=(symbol,))
     if not fund_df.empty:
-        fund_df['calc_time'] = pd.to_datetime(fund_df['calc_time'], unit='ms').dt.floor('S')
+        fund_df['calc_time'] = pd.to_datetime(fund_df['calc_time'], unit='ms').dt.floor('s')
         df = pd.merge_asof(df, fund_df, left_on='timestamp', right_on='calc_time', direction='backward', tolerance=pd.Timedelta(hours=16))
     else:
         df['last_funding_rate'] = np.nan
@@ -265,12 +268,18 @@ def optimize_lgbm_hyperparameters(X_train, y_train, X_val, y_val, n_trials=50):
             callbacks=[lgb.early_stopping(stopping_rounds=25)]
         )
         
-        return model.best_score['valid']['rmse']
+        return model.best_score['valid_0']['rmse']
 
     study = optuna.create_study(direction='minimize')
     study.optimize(objective, n_trials=n_trials)
     
     print(f"✅ Best Trial: RMSE {study.best_value:.4f}")
+    
+    # Persistent Save
+    os.makedirs(MODEL_DIR, exist_ok=True)
+    with open(PARAMS_PATH, 'w') as f:
+        json.dump(study.best_params, f, indent=4)
+        
     return study.best_params
 
 def train_ensemble_models(mega_df, optimized_params=None):
@@ -284,6 +293,12 @@ def train_ensemble_models(mega_df, optimized_params=None):
     train_data_lgb = lgb.Dataset(X_train, label=y_train)
     val_data_lgb = lgb.Dataset(X_val, label=y_val, reference=train_data_lgb)
     
+    # Load persisted params if none provided
+    if optimized_params is None and os.path.exists(PARAMS_PATH):
+        print(f"📂 Loading persisted HPO parameters from {PARAMS_PATH}")
+        with open(PARAMS_PATH, 'r') as f:
+            optimized_params = json.load(f)
+
     lgb_params = {
         'objective': 'regression',
         'metric': 'rmse',

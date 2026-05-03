@@ -1,5 +1,6 @@
 {
-    "validation_rmse": 0.22444864974857057,
-    "validation_spearman_correlation": 0.5730666091236143,
-    "spearman_p_value": 2.4380185520222704e-20
+    "validation_spearman_correlation": 0.05761390213210632,
+    "spearman_p_value": 0.0,
+    "timestamp": "20260503_095911",
+    "is_ensemble": true
 }

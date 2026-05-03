@@ -20,8 +20,8 @@ import numpy as np
 # ─────────────────────────────────────────────
 # Constants
 # ─────────────────────────────────────────────
-DEFAULT_SLIPPAGE  = 0.0005    # 5 bps slippage estimate
-DEFAULT_TAKER_FEE = 0.00055   # Hyperliquid taker fee (0.055%)
+DEFAULT_SLIPPAGE  = 0.0001    # 1 bps slippage (Hyperliquid on-chain book, liquid futures)
+DEFAULT_TAKER_FEE = 0.00045   # Hyperliquid taker fee (0.045%)
 
 def simulate_portfolio(
     mega_df: pd.DataFrame,
@@ -34,6 +34,7 @@ def simulate_portfolio(
     timeframe: str = '1h',
     weighting_mode: str = 'equal', # 'equal' or 'risk_parity'
     mc_sims: int = 2500,
+    hysteresis_factor: float = 3.0,
 ) -> dict:
     """
     Vectorized long/short portfolio simulation from LightGBM predictions.
@@ -67,9 +68,8 @@ def simulate_portfolio(
     df = mega_df.copy()
     df['predicted_rank'] = predictions
 
-    # P1-7 FIX: Ensure rebalance_freq aligns with the fwd_return horizon
-    if rebalance_freq != 6:
-        print(f"⚠️ WARNING: rebalance_freq ({rebalance_freq}) != fwd_return horizon (6). Returns will be distorted!")
+    # P1-7: Log rebalance cadence for transparency
+    print(f"📊 Rebalance cadence: every {rebalance_freq} bars | Hysteresis buffer: {hysteresis_factor:.1f}x")
 
     # ─── Group by timestamp to get cross-sectional snapshots ───
     timestamps = np.sort(df['timestamp'].unique())
@@ -91,10 +91,28 @@ def simulate_portfolio(
         if len(snapshot) < total_basket_size:
             continue  # Not enough assets for a full basket
 
-        # Rank and select
+        # Implement Hysteresis (Friction) Buffer
         snapshot = snapshot.sort_values('predicted_rank', ascending=False)
-        longs = snapshot.head(top_n)
-        shorts = snapshot.tail(bottom_n)
+        
+        long_buffer_n = int(top_n * hysteresis_factor)
+        short_buffer_n = int(bottom_n * hysteresis_factor)
+        
+        # --- LONG SELECTION ---
+        eligible_longs = snapshot.head(long_buffer_n)
+        kept_longs = eligible_longs[eligible_longs['symbol'].isin(prev_longs)]
+        needed_longs = top_n - len(kept_longs)
+        
+        # Fill the remaining slots with the absolute highest ranked that aren't already kept
+        new_longs = eligible_longs[~eligible_longs['symbol'].isin(prev_longs)].head(needed_longs)
+        longs = pd.concat([kept_longs, new_longs])
+        
+        # --- SHORT SELECTION ---
+        eligible_shorts = snapshot.tail(short_buffer_n)
+        kept_shorts = eligible_shorts[eligible_shorts['symbol'].isin(prev_shorts)]
+        needed_shorts = bottom_n - len(kept_shorts)
+        
+        new_shorts = eligible_shorts[~eligible_shorts['symbol'].isin(prev_shorts)].tail(needed_shorts)
+        shorts = pd.concat([kept_shorts, new_shorts])
         
         curr_longs = set(longs['symbol'])
         curr_shorts = set(shorts['symbol'])

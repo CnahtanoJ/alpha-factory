@@ -63,6 +63,9 @@ def generate_report(cycle_results: dict) -> str:
     spearman = model_meta.get('validation_spearman_correlation', 'N/A')
     p_val = model_meta.get('spearman_p_value', 'N/A')
 
+    def fmt(v):
+        return f"{v:.4f}" if isinstance(v, (int, float)) else str(v)
+
     if isinstance(spearman, float):
         if spearman > 0.10:
             health = "🟢 Strong"
@@ -70,7 +73,7 @@ def generate_report(cycle_results: dict) -> str:
             health = "🟡 Moderate"
         else:
             health = "🔴 Weak"
-        md += f"> Model Health: {health} | Spearman ρ = **{spearman:.4f}** (p={p_val:.4f}) | RMSE = {rmse:.4f}\n\n"
+        md += f"> Model Health: {health} | Spearman ρ = **{spearman:.4f}** (p={fmt(p_val)}) | RMSE = {fmt(rmse)}\n\n"
     else:
         md += f"> Model Health: Unknown | RMSE = {rmse} | Spearman = {spearman}\n\n"
 

@@ -40,7 +40,7 @@ class LiveInferenceEngine:
         if not candles: return None
         df = pd.DataFrame(candles)
         # candles have t, o, h, l, c, v
-        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms').dt.floor('S')
+        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms').dt.floor('s')
         df = df.sort_values('timestamp').reset_index(drop=True)
         
         if index_df is not None and not index_df.empty:
@@ -57,7 +57,7 @@ class LiveInferenceEngine:
                 idx_q = "SELECT timestamp as idx_ts, close as index_close FROM index_ohlcv WHERE symbol = ? ORDER BY timestamp DESC LIMIT 100"
                 idx_df = pd.read_sql_query(idx_q, self.conn, params=(symbol,))
                 if not idx_df.empty:
-                    idx_df['idx_ts'] = pd.to_datetime(idx_df['idx_ts'], unit='ms').dt.floor('S')
+                    idx_df['idx_ts'] = pd.to_datetime(idx_df['idx_ts'], unit='ms').dt.floor('s')
                     df = pd.merge_asof(df, idx_df, left_on='timestamp', right_on='idx_ts', direction='backward')
             except Exception as e:
                 logger.warning(f"⚠️ Could not fetch historical index data for {symbol}: {e}")
@@ -247,18 +247,34 @@ def executor_handler(event, context):
             logger.warning("⚠️ Falling back to simple Momentum Rank (RSI + MACD).")
             mega_df['predicted_rank'] = (mega_df['rank_rsi'] + mega_df['rank_macd']) / 2
 
-        # 6. 🔪 SORT AND SLICE (Market Neutral Basket)
+        # 6. 🔪 SORT AND SLICE (Market Neutral Basket with Hysteresis)
+        BASKET_N = 3
+        HYSTERESIS_FACTOR = 3.0
+        buffer_n = int(BASKET_N * HYSTERESIS_FACTOR)  # =9, keeps coins if they stay in top 9/bottom 9
+        
         mega_df = mega_df.sort_values('predicted_rank', ascending=False)
         
-        top_3 = mega_df.head(3)
-        bottom_3 = mega_df.tail(3)
+        # Get currently open positions to apply hysteresis
+        current_longs = set(coin for coin, pos in portfolio.items() if pos.get('szi', 0) > 0)
+        current_shorts = set(coin for coin, pos in portfolio.items() if pos.get('szi', 0) < 0)
         
-        target_longs = top_3['symbol'].tolist()
-        target_shorts = bottom_3['symbol'].tolist()
+        # --- LONG SELECTION with Hysteresis ---
+        eligible_longs = mega_df.head(buffer_n)
+        kept_longs = eligible_longs[eligible_longs['symbol'].isin(current_longs)]['symbol'].tolist()
+        needed_longs = BASKET_N - len(kept_longs)
+        new_longs = eligible_longs[~eligible_longs['symbol'].isin(current_longs)].head(needed_longs)['symbol'].tolist()
+        target_longs = kept_longs + new_longs
+        
+        # --- SHORT SELECTION with Hysteresis ---
+        eligible_shorts = mega_df.tail(buffer_n)
+        kept_shorts = eligible_shorts[eligible_shorts['symbol'].isin(current_shorts)]['symbol'].tolist()
+        needed_shorts = BASKET_N - len(kept_shorts)
+        new_shorts = eligible_shorts[~eligible_shorts['symbol'].isin(current_shorts)].tail(needed_shorts)['symbol'].tolist()
+        target_shorts = kept_shorts + new_shorts
         
         target_basket = target_longs + target_shorts
-        logger.info(f"🎯 TARGET LONGS: {target_longs}")
-        logger.info(f"🎯 TARGET SHORTS: {target_shorts}")
+        logger.info(f"🎯 TARGET LONGS: {target_longs} (kept: {kept_longs})")
+        logger.info(f"🎯 TARGET SHORTS: {target_shorts} (kept: {kept_shorts})")
         
         # --- PHASE 5: MARKET-NEUTRAL EXECUTION ---
         
@@ -267,7 +283,7 @@ def executor_handler(event, context):
         for active_coin in list(portfolio.keys()):
             # If open position is NOT in our new basket, KILL IT.
             if active_coin not in target_basket:
-                logger.info(f"🧹 RECONCILIATION: {active_coin} dropped out of Top/Bottom 3. Closing position.")
+                logger.info(f"🧹 RECONCILIATION: {active_coin} dropped out of buffer zone. Closing position.")
                 send_telegram_message(f"🧹 RECONCILIATION: {active_coin} lost its edge. Closing.")
                 risk.close_active_position(active_coin, all_mids, temp_assets, portfolio, AWS_BUCKET)
                 

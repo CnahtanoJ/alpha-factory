@@ -62,7 +62,7 @@ class UniversalGapPatcher:
                     AND u.start_ts=timestamp AND u.end_ts=next_ts
                 )
             """
-            gaps = self.conn.execute(query, (symbol, timeframe, market, tf_ms, symbol, timeframe)).fetchall()
+            gaps = self.conn.execute(query, (symbol, timeframe, market, tf_ms * 1.5, symbol, timeframe)).fetchall()
             
             if not gaps:
                 print(f"    [OK] No gaps found.")
@@ -74,12 +74,17 @@ class UniversalGapPatcher:
                 print(f"    [GAP] Gap: {pd.to_datetime(ts, unit='ms')} -> {pd.to_datetime(next_ts, unit='ms')} ({missing_count} bars)")
                 
                 if not dry_run:
-                    self._patch_daily_zip(
+                    inserted = self._patch_daily_zip(
                         table='ohlcv', symbol=symbol, ts=ts, next_ts=next_ts,
                         time_col='timestamp', data_type='klines', timeframe=timeframe,
                         extra_cols={'market': market},
                         insert_cols=['timestamp', 'symbol', 'timeframe', 'market', 'open', 'high', 'low', 'close', 'volume']
                     )
+                    if inserted == 0:
+                        print("    [INFO] Marking gap as unfillable to prevent future re-checks.")
+                        self.conn.execute("INSERT OR IGNORE INTO unfillable_gaps (table_name, symbol, timeframe, start_ts, end_ts) VALUES (?, ?, ?, ?, ?)",
+                            ('ohlcv', symbol, timeframe, ts, next_ts))
+                        self.conn.commit()
 
     def patch_index_ohlcv(self, dry_run=True):
         print("\n=== Auditing: index_ohlcv (Index Price) ===")
@@ -107,7 +112,7 @@ class UniversalGapPatcher:
                     AND u.start_ts=timestamp AND u.end_ts=next_ts
                 )
             """
-            gaps = self.conn.execute(query, (symbol, timeframe, tf_ms, symbol, timeframe)).fetchall()
+            gaps = self.conn.execute(query, (symbol, timeframe, tf_ms * 1.5, symbol, timeframe)).fetchall()
             
             if not gaps:
                 print(f"    [OK] No gaps found.")
@@ -154,7 +159,7 @@ class UniversalGapPatcher:
                     AND u.start_ts=timestamp AND u.end_ts=next_ts
                 )
             """
-            gaps = self.conn.execute(query, (symbol, tf_ms, symbol)).fetchall()
+            gaps = self.conn.execute(query, (symbol, tf_ms * 1.5, symbol)).fetchall()
             
             if not gaps:
                 print(f"    [OK] No gaps found.")
@@ -204,7 +209,7 @@ class UniversalGapPatcher:
                     AND u.start_ts=calc_time AND u.end_ts=next_ts
                 )
             """
-            gaps = self.conn.execute(query, (symbol, tf_ms, symbol)).fetchall()
+            gaps = self.conn.execute(query, (symbol, tf_ms * 1.5, symbol)).fetchall()
             
             if not gaps:
                 print(f"    [OK] No gaps found.")
@@ -218,7 +223,7 @@ class UniversalGapPatcher:
                 if not dry_run:
                     inserted = self._patch_monthly_zip(
                         table='funding_rate', symbol=symbol, ts=ts, next_ts=next_ts,
-                        time_col='calc_time', data_type='fundingRate',
+                        time_col='calc_time', data_type='fundingRate', timeframe='8h',
                         extra_cols={},
                         insert_cols=['calc_time', 'symbol', 'funding_interval_hours', 'last_funding_rate']
                     )

@@ -34,6 +34,13 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 MODEL_DIR = os.path.join(os.path.dirname(__file__), 'models')
 MODEL_PATH = os.path.join(MODEL_DIR, 'cross_sectional_lgbm.txt')
 META_PATH = os.path.join(MODEL_DIR, 'cross_sectional_lgbm_meta.json')
+FEATURES_PATH = os.path.join(MODEL_DIR, 'features.json')
+
+
+def _bars_per_day(timeframe: str) -> int:
+    """Return the number of bars in one day for a given timeframe string."""
+    tf_map = {'1m': 1440, '5m': 288, '15m': 96, '30m': 48, '1h': 24, '4h': 6}
+    return tf_map.get(timeframe, 96)  # Default to 15m
 
 
 def get_feature_names():
@@ -105,18 +112,21 @@ def extract_per_asset_drivers(
     bottom_assets = snapshot.tail(bottom_n)
 
     def get_extreme_features(assets_df):
-        """Find which ranked features are extreme for these assets."""
-        rank_features = [f for f in feature_names if f.startswith('rank_')]
+        """Find which ranked features or strategy signals are extreme for these assets."""
+        driver_features = [f for f in feature_names if f.startswith('rank_') or f.startswith('sig_')]
         drivers = {}
         for _, row in assets_df.iterrows():
             symbol = row['symbol']
             extreme = {}
-            for feat in rank_features:
+            for feat in driver_features:
                 val = row.get(feat, 0.5)
-                if val > 0.85:
-                    extreme[feat] = f"Very High ({val:.2f})"
-                elif val < 0.15:
-                    extreme[feat] = f"Very Low ({val:.2f})"
+                if feat.startswith('sig_') and val != 0:
+                    extreme[feat] = f"Active Signal ({val})"
+                elif feat.startswith('rank_'):
+                    if val > 0.85:
+                        extreme[feat] = f"Very High ({val:.2f})"
+                    elif val < 0.15:
+                        extreme[feat] = f"Very Low ({val:.2f})"
             drivers[symbol] = extreme
         return drivers
 
@@ -133,8 +143,10 @@ def run_weekly_cycle(
     timeframe='15m',
     force_train=False,
     dry_run_weeks=4,
-    top_n=10,
-    bottom_n=10,
+    top_n=3,
+    bottom_n=3,
+    optimize=False,
+    n_trials=50,
 ):
     """
     The master orchestrator for the weekly intelligence cycle.
@@ -180,27 +192,34 @@ def run_weekly_cycle(
     # =========================================================
     # STEP 1: LOAD PREVIOUS MODEL FOR OOS SIMULATION
     # =========================================================
-    previous_model, prev_features = load_previous_model()
+    # ─── WALK-FORWARD SPLIT ───
+    # Hold out the last N weeks from training so OOS is ALWAYS genuinely unseen.
+    latest_ts = mega_df['timestamp'].max()
+    oos_cutoff = latest_ts - pd.Timedelta(weeks=dry_run_weeks)
+    train_df = mega_df[mega_df['timestamp'] < oos_cutoff].copy()
+    oos_df = mega_df[mega_df['timestamp'] >= oos_cutoff].copy()
+    
+    logger.info(f"📐 Walk-Forward Split: Train={len(train_df):,} rows (before {oos_cutoff}) | OOS={len(oos_df):,} rows (after)")
 
+    # =========================================================
+    # STEP 1: OOS SIMULATION WITH PREVIOUS MODEL
+    # =========================================================
+    previous_model, prev_features = load_previous_model()
     simulation_results = None
-    if previous_model is not None and not force_train:
+    if previous_model is not None:
         logger.info("🔬 WEEKLY CYCLE: Running OOS Simulation with PREVIOUS model...")
 
         from backtester.dry_run_simulator import simulate_portfolio
 
-        # Define OOS window: the most recent `dry_run_weeks` weeks
-        latest_ts = mega_df['timestamp'].max()
-        oos_start = latest_ts - pd.Timedelta(weeks=dry_run_weeks)
-        oos_df = mega_df[mega_df['timestamp'] >= oos_start].copy()
-
         if len(oos_df) > 0:
-            # Predict with the OLD model
+            # Predict with the OLD model on truly unseen data
             X_oos = oos_df[prev_features]
             oos_predictions = previous_model.predict(X_oos)
 
             simulation_results = simulate_portfolio(
                 oos_df, oos_predictions,
                 top_n=top_n, bottom_n=bottom_n,
+                rebalance_freq=_bars_per_day(timeframe),
                 timeframe=timeframe,
                 weighting_mode='risk_parity'
             )
@@ -210,17 +229,22 @@ def run_weekly_cycle(
         else:
             logger.warning("⚠️ Not enough OOS data for simulation.")
     else:
-        if force_train:
-            logger.info("🔄 Force-train requested. Skipping OOS simulation with old model.")
-        else:
-            logger.info("🆕 First run — no previous model. OOS simulation skipped.")
+        logger.info("🆕 First run — no previous model. OOS simulation skipped.")
 
     # =========================================================
-    # STEP 2: TRAIN NEW LIGHTGBM MODEL
+    # STEP 2: TRAIN NEW MODEL (on data EXCLUDING the OOS window)
     # =========================================================
-    logger.info("🧠 WEEKLY CYCLE: Training NEW LightGBM model...")
+    logger.info(f"🧠 WEEKLY CYCLE: Training NEW LightGBM model on {len(train_df):,} rows...")
 
-    model, features = train_cross_sectional_lgbm(mega_df)
+    best_params = None
+    if optimize:
+        logger.info(f"🚀 Manual Optimization requested. Triggering Optuna HPO ({n_trials} trials)...")
+        from analytics.cross_sectional import prepare_training_data, optimize_lgbm_hyperparameters
+        X_train, y_train, X_val, y_val, features = prepare_training_data(train_df)
+        best_params = optimize_lgbm_hyperparameters(X_train, y_train, X_val, y_val, n_trials=n_trials)
+        logger.info("✅ Optimization complete. Training model with best parameters...")
+
+    model, features = train_cross_sectional_lgbm(train_df, optimized_params=best_params)
 
     # ─── ELITE GATEKEEPER ───
     # We load the meta to check the Spearman Correlation
@@ -236,11 +260,11 @@ def run_weekly_cycle(
         logger.info("🔄 Triggering Optuna HPO to find a more robust model...")
         
         from analytics.cross_sectional import prepare_training_data, optimize_lgbm_hyperparameters
-        X_train, y_train, X_val, y_val, features = prepare_training_data(mega_df)
+        X_train, y_train, X_val, y_val, features = prepare_training_data(train_df)
         best_params = optimize_lgbm_hyperparameters(X_train, y_train, X_val, y_val, n_trials=30)
         
         # Re-train with optimized parameters
-        model, features = train_cross_sectional_lgbm(mega_df, optimized_params=best_params)
+        model, features = train_cross_sectional_lgbm(train_df, optimized_params=best_params)
         
         # Reload meta after re-train
         with open(META_PATH, 'r') as f:
