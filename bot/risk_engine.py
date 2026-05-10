@@ -483,32 +483,12 @@ class RiskEngine:
         except: pass
         time.sleep(1) # L-4 Fix: Reduce naked exposure
         
-        # 3. Place NEW Unified TP/SL
-        logger.info(f"🛡️ REFRESHING TP/SL: Total {total_sz} @ {avg_entry} | ATR: {current_atr_pct:.2%}")
+        # 3. Place NEW Unified SL (Trailing Initial)
+        logger.info(f"🛡️ PLACING INITIAL SL: Total {total_sz} @ {avg_entry} | ATR: {current_atr_pct:.2%}")
         
-        # A. Unified Take Profits (Dynamic ATR Multipliers)
-        # Format: (Size Percentage, ATR Multiplier)
-        tp_levels = [(1, 1.5)] 
-        d = 1 if is_buy_pos else -1
-        
-        for (pct, atr_mult) in tp_levels:
-            # Calculate the required price move based on the current volatility
-            move = current_atr_pct * atr_mult
-            tp_px = self.assets.get_price_precision(coin, avg_entry * (1 + (move * d)))
-            tp_sz = self.assets.round_size(coin, total_sz * pct)
-            
-            if tp_sz <= 0: continue # Failsafe against zero-size API rejections
-
-            self.exchange.order(
-                coin, not is_buy_pos, tp_sz, tp_px, 
-                {"trigger": {"isMarket": True, "triggerPx": tp_px, "tpsl": "tp"}},
-                reduce_only=True
-            )
-            send_telegram_message(f"🎯 TP ({atr_mult}x ATR): {tp_sz} @ {tp_px}")
-
-        # B. Unified Stop Loss (Dynamic Volatility Shield)
         sl_mult = 2.0
         hard_sl_pct = current_atr_pct * sl_mult
+        d = 1 if is_buy_pos else -1
         sl_px = self.assets.get_price_precision(coin, avg_entry * (1 - (hard_sl_pct * d)))
         
         self.exchange.order(
@@ -516,30 +496,23 @@ class RiskEngine:
             {"trigger": {"isMarket": True, "triggerPx": sl_px, "tpsl": "sl"}},
             reduce_only=True
         )
-        send_telegram_message(f"🛑 SL ({sl_mult}x ATR): {total_sz} @ {sl_px}")
+        send_telegram_message(f"🛑 INITIAL SL ({sl_mult}x ATR): {total_sz} @ {sl_px}")
 
-    def sync_break_even(self, coin, current_atr_pct, portfolio, open_orders):        
+    def sync_trailing_stop(self, coin, current_atr_pct, portfolio, open_orders):        
         # =========================================================
         # 💀 CASE A: POST-MORTEM (Position is Gone)
         # =========================================================
         if coin not in portfolio:
             if self.memory.get(coin, 'entry_time', default=0) > 0: 
-                # P2-8: Circuit Breaker Update
-                tp1_hit = self.memory.get(coin, 'tp1_hit', default=False)
                 streak = self.memory.get('GLOBAL', 'consecutive_losses', default=0)
+                # Since we don't have a fixed TP anymore, we assume it's a loss if it hit SL,
+                # UNLESS the exit price was higher than entry. For now, we assume loss to be safe.
+                streak += 1
+                self.memory.set('GLOBAL', 'consecutive_losses', streak)
+                logger.info(f"📉 {coin} position closed. Consecutive losses metric: {streak}")
                 
-                if tp1_hit:
-                    self.memory.set('GLOBAL', 'consecutive_losses', 0)
-                    logger.info(f"📈 {coin} closed in profit/BE. Streak reset.")
-                    current_streak = 0
-                else:
-                    streak += 1
-                    self.memory.set('GLOBAL', 'consecutive_losses', streak)
-                    logger.info(f"📉 {coin} hit hard SL. Consecutive losses: {streak}")
-                    current_streak = streak
-                    
                 logger.info(f"🔔 DETECTED EXIT: {coin} position is gone.")
-                send_telegram_message(f"🔔 NOTIFICATION: {coin} Position Closed. Current Loss Streak: {current_streak}")
+                send_telegram_message(f"🔔 NOTIFICATION: {coin} Position Closed. Current Streak Metric: {streak}")
                 self.memory.clear(coin)
             return
 
@@ -549,13 +522,10 @@ class RiskEngine:
         
         if stored_entry != 0 and abs(current_entry - stored_entry) / current_entry > 0.005: # 0.5% diff
             logger.info(f"🆕 NEW TRADE DETECTED! Entry changed {stored_entry} -> {current_entry}")
-            logger.info("🧹 Wiping stale memory (resetting TP1/SL flags).")
-            
-            # Reset everything for the fresh start
+            logger.info("🧹 Wiping stale memory (resetting SL).")
             self.memory.clear(coin)
             self.memory.set(coin, 'last_known_entry', current_entry)
                 
-        # If this is the first time we see it, just save it
         if stored_entry == 0:
              self.memory.set(coin, 'last_known_entry', current_entry)
 
@@ -567,9 +537,7 @@ class RiskEngine:
         curr_px = float(self.info.all_mids()[coin])
         is_long = pos_size > 0
 
-        # ---------------------------------------------------------
-        # 🛡️ SAFETY NET: THE "ONE LINE" FIX
-        # ---------------------------------------------------------
+        # Find existing SL
         existing_sl = next((
             o for o in open_orders 
             if o['coin'] == coin 
@@ -577,13 +545,12 @@ class RiskEngine:
             and "stop" in str(o.get('orderType', '')).lower()
         ), None)
 
-        # IF NAKED -> RESET EVERYTHING
         if not existing_sl:
             logger.warning(f"😱 NAKED POSITION: {coin} missing SL. Resetting Orders!")
             self.sync_unified_orders(coin, current_atr_pct, portfolio)
             return
 
-        # 1. ⚠️ SOFT STOP WATCHDOG (Notify Only)
+        # 1. ⚠️ SOFT STOP WATCHDOG
         soft_dist = 0.01 
         soft_limit = entry_px * (1 - soft_dist) if is_long else entry_px * (1 + soft_dist)
         soft_hit = (curr_px < soft_limit) if is_long else (curr_px > soft_limit)
@@ -591,92 +558,45 @@ class RiskEngine:
         if soft_hit:
             if not self.memory.get(coin, 'soft_warned'):
                 logger.warning(f"⚠️ SOFT STOP: {coin} breached 1%!")
-                send_telegram_message(f"⚠️ SOFT STOP ALERT: {coin} is down > 1% @ {curr_px}. Hard Stop is at 1.2%.")
+                send_telegram_message(f"⚠️ SOFT STOP ALERT: {coin} is down > 1% @ {curr_px}.")
                 self.memory.set(coin, 'soft_warned', True)
 
-        # 2. ✅ TP1 BREAK EVEN CHECK (Robust "Order-Gone" Version)
-        if not self.memory.get(coin, 'tp1_hit'):
+        # 2. 📈 RATCHETING TRAILING STOP
+        trail_dist = current_atr_pct * 2.0
+        d = 1 if is_long else -1
+        
+        # Calculate new potential SL
+        new_sl_px = curr_px * (1 - (trail_dist * d))
+        current_sl_px = float(existing_sl['triggerPx'])
+        
+        # Check if the new SL is better than the current SL by at least 0.2% (to prevent API spam)
+        sl_improved = (new_sl_px > current_sl_px * 1.002) if is_long else (new_sl_px < current_sl_px * 0.998)
+        
+        if sl_improved:
+            safe_new_sl = self.assets.get_price_precision(coin, new_sl_px)
+            logger.info(f"📈 TRAILING STOP TRIGGERED: Moving {coin} SL from {current_sl_px} to {safe_new_sl}")
             
-            # A. Calculate where TP1 *should* be to identify the order
-            # Use same multiplier (1.5) as sync_unified_orders (L-3 Fix)
-            tp_dist = current_atr_pct * 1.5
-            target_px = entry_px * (1 + tp_dist) if is_long else entry_px * (1 - tp_dist)
-            
-            # B. Look for the TP1 Limit Order
-            tp1_order_active = False
-            required_side = 'A' if is_long else 'B'
-            
-            for o in open_orders:
-                # 1. Basic coin and side check
-                if o['coin'] == coin and o['side'] == required_side:
-                    
-                    # 2. Extract price (TP Market uses 'triggerPx', Limit uses 'limitPx')
-                    raw_px = o.get('triggerPx') or o.get('limitPx')
-                    if not raw_px: continue
-                    
-                    order_px = float(raw_px)
-                    
-                    # 3. Check if this order is our TP1 (within 0.2% tolerance)
-                    if abs(order_px - target_px) / target_px < 0.002:
-                        tp1_order_active = True
-                        logger.info(f"🎯 Found active TP1 order at {order_px}")
-                        break
-            
-            # D. If position exists but TP1 order is GONE, it means TP hit
-            if not tp1_order_active:
-                logger.info(f"🚀 TP1 DETECTED: Limit order at {target_px} is gone. Moving SL to Breakeven.")
+            try:
+                self.exchange.cancel(coin, existing_sl['oid'])
+                time.sleep(1)
 
-                # A. Find Existing SL (Avoid Duplicates)
-                existing_sl = next((
-                    o for o in open_orders 
-                    if o['coin'] == coin and o['isTrigger'] and "stop" in str(o.get('orderType', '')).lower()
-                ), None)
-
-                # If SL is ALREADY at Breakeven (Tolerance 0.2%)
-                if existing_sl:
-                    sl_trigger = float(existing_sl['triggerPx'])
-                    if abs(sl_trigger - entry_px) / entry_px < 0.002:
-                        logger.info("✅ SL already at Breakeven. Syncing memory.")
-                        self.memory.set(coin, 'tp1_hit', True)
-                        return
-
-                # B. Execute Move
-                safe_entry_px = self.assets.get_price_precision(coin, entry_px)
+                res = self.exchange.order(
+                    coin, 
+                    not is_long, 
+                    abs(pos_size), 
+                    safe_new_sl, 
+                    {"trigger": {"isMarket": True, "triggerPx": safe_new_sl, "tpsl": "sl"}},
+                    reduce_only=True
+                )
                 
-                logger.info(f"🛡️ MOVING SL TO: {safe_entry_px}")
-                send_telegram_message(f"✅ TP1 Hit (Order Filled)! Securing {coin} at {safe_entry_px}")
-
-                try:
-                    if existing_sl:
-                        self.exchange.cancel(coin, existing_sl['oid'])
-                        logger.info('Old SL Cancelled.')
-                        # Reduced sleep to 1s; 5s is quite long for high-speed markets
-                        time.sleep(1)
-
-                    res = self.exchange.order(
-                        coin, 
-                        not is_long, 
-                        abs(pos_size), 
-                        safe_entry_px, 
-                        {"trigger": {"isMarket": True, "triggerPx": safe_entry_px, "tpsl": "sl"}},
-                        reduce_only=True
-                    )
-                    
-                    logger.info(f"📬 SL RESPONSE: {res}")
-
-                    if res['status'] == 'ok':
-                        logger.info("✅ SL Move Confirmed by Exchange.")
-                        self.memory.set(coin, 'tp1_hit', True)
-                    else:
-                        err_msg = res.get('response', {}).get('data', 'Unknown Error')
-                        logger.error(f"❌ SL MOVE REJECTED: {err_msg}")
-                        send_telegram_message(f"⚠️ SL Failed: {err_msg}")
-
-                except Exception as e:
-                    logger.error(f"💥 CRASH MOVING SL: {e}")
-            else:
-                pass
-                
+                if res['status'] == 'ok':
+                    logger.info("✅ Trailing SL Move Confirmed.")
+                    send_telegram_message(f"📈 TRAILING STOP: {coin} SL raised to {safe_new_sl} (Current Price: {curr_px})")
+                else:
+                    err_msg = res.get('response', {}).get('data', 'Unknown Error')
+                    logger.error(f"❌ SL MOVE REJECTED: {err_msg}")
+            except Exception as e:
+                logger.error(f"💥 CRASH MOVING TRAILING SL: {e}")
     def close_active_position(self, active_coin, all_mids, temp_assets, portfolio, aws_bucket):
         """
         Safely closes an open position and clears its state.

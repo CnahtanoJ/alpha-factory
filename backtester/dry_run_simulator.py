@@ -34,7 +34,7 @@ def simulate_portfolio(
     timeframe: str = '1h',
     weighting_mode: str = 'equal', # 'equal' or 'risk_parity'
     mc_sims: int = 2500,
-    hysteresis_factor: float = 3.0,
+    hysteresis_factor: float = 5.0,
 ) -> dict:
     """
     Vectorized long/short portfolio simulation from LightGBM predictions.
@@ -117,6 +117,30 @@ def simulate_portfolio(
         curr_longs = set(longs['symbol'])
         curr_shorts = set(shorts['symbol'])
 
+        # ─── VECTORIZED TRAILING STOP LOGIC ───
+        # Trailing distance = 2.0x ATR
+        long_trail_dist = longs['atr_pct'] * 2.0
+        
+        long_initial_sl_hit = longs['fwd_min_ret'] <= -long_trail_dist
+        long_retrace_hit = (longs['fwd_max_ret'] - longs['fwd_return']) >= long_trail_dist
+        
+        # Conservative: If initial SL hit, we take the full loss. Else, check if it retraced from the peak.
+        long_actual_returns = np.where(
+            long_initial_sl_hit, -long_trail_dist,
+            np.where(long_retrace_hit, longs['fwd_max_ret'] - long_trail_dist, longs['fwd_return'])
+        )
+
+        short_trail_dist = shorts['atr_pct'] * 2.0
+        
+        short_initial_sl_hit = shorts['fwd_max_ret'] >= short_trail_dist
+        short_retrace_hit = (shorts['fwd_return'] - shorts['fwd_min_ret']) >= short_trail_dist
+        
+        # Simulated price movement of the underlying asset
+        short_sim_move = np.where(
+            short_initial_sl_hit, short_trail_dist,
+            np.where(short_retrace_hit, shorts['fwd_min_ret'] + short_trail_dist, shorts['fwd_return'])
+        )
+
         # ─── RETURN CALCULATION ───
         if weighting_mode == 'risk_parity':
             # Weight is inversely proportional to volatility (ATR%)
@@ -129,12 +153,12 @@ def simulate_portfolio(
             short_weights /= short_weights.sum()
             
             # Weighted returns
-            long_return = (longs['fwd_return'] * long_weights).sum()
-            short_return = (shorts['fwd_return'] * short_weights).sum()
+            long_return = (long_actual_returns * long_weights).sum()
+            short_return = (short_sim_move * short_weights).sum()
         else:
             # Equal-weighted
-            long_return = longs['fwd_return'].mean()
-            short_return = shorts['fwd_return'].mean()
+            long_return = long_actual_returns.mean()
+            short_return = short_sim_move.mean()
 
         # Long/Short portfolio: profit on longs going up, shorts going down
         # Equal-weighted or Risk-Parity, dollar-neutral
@@ -167,17 +191,17 @@ def simulate_portfolio(
         })
 
         # Log individual trades
-        for _, row in longs.iterrows():
+        for i, (_, row) in enumerate(longs.iterrows()):
             trade_log.append({
                 'timestamp': rb_ts, 'symbol': row['symbol'],
                 'side': 'LONG', 'predicted_rank': row['predicted_rank'],
-                'actual_return': row['fwd_return']
+                'actual_return': long_actual_returns[i]
             })
-        for _, row in shorts.iterrows():
+        for i, (_, row) in enumerate(shorts.iterrows()):
             trade_log.append({
                 'timestamp': rb_ts, 'symbol': row['symbol'],
                 'side': 'SHORT', 'predicted_rank': row['predicted_rank'],
-                'actual_return': -row['fwd_return']  # Shorts profit on decline
+                'actual_return': -short_sim_move[i]  # Shorts profit on decline
             })
 
     if not portfolio_returns:

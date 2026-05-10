@@ -48,7 +48,10 @@ def get_feature_names():
     continuous_features = [
         'rank_rsi', 'rank_macd', 'rank_volatility_20', 'rank_basis_pct',
         'rank_oi_usd', 'rank_funding_rate',
-        'rank_sum_toptrader_long_short_ratio', 'rank_corr_to_index'
+        'rank_sum_toptrader_long_short_ratio', 'rank_corr_to_index',
+        'rank_oi_delta_4', 'rank_funding_delta_4', 'rank_taker_buy_sell_ratio',
+        'rank_distance_from_ema_50', 'rank_volatility_zscore', 'rank_volume_zscore', 'rank_relative_strength_btc',
+        'rank_cvd_slope_5', 'rank_price_cvd_divergence'
     ]
     time_features = ['hour_sin', 'hour_cos', 'day_sin', 'day_cos']
     return continuous_features, time_features
@@ -213,6 +216,13 @@ def run_weekly_cycle(
 
         if len(oos_df) > 0:
             # Predict with the OLD model on truly unseen data
+            # Handle feature schema changes gracefully
+            missing_features = [f for f in prev_features if f not in oos_df.columns]
+            if missing_features:
+                logger.warning(f"⚠️ Missing features for OOS simulation (schema changed?): {missing_features}. Filling with 0.5 (median rank).")
+                for f in missing_features:
+                    oos_df[f] = 0.5
+                    
             X_oos = oos_df[prev_features]
             oos_predictions = previous_model.predict(X_oos)
 

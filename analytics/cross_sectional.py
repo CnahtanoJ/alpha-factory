@@ -11,7 +11,6 @@ import gc
 from scipy.stats import spearmanr
 from ta.momentum import RSIIndicator
 from ta.trend import MACD
-from bot.strategies import STRATEGY_CONFIG
 from data_pipeline.database import DB_PATH
 
 try:
@@ -42,7 +41,7 @@ def fetch_and_merge_symbol_data(symbol, conn, timeframe='15m'):
         df['index_close'] = df['close'] # Fallback
 
     # 3. Fetch Symbol Metrics (C-4 FIX: fetch sum_open_interest_value which is already in USD)
-    metrics_df = pd.read_sql_query("SELECT timestamp as met_ts, sum_open_interest, sum_open_interest_value, sum_toptrader_long_short_ratio FROM symbol_metrics WHERE symbol = ? ORDER BY timestamp", conn, params=(symbol,))
+    metrics_df = pd.read_sql_query("SELECT timestamp as met_ts, sum_open_interest, sum_open_interest_value, sum_toptrader_long_short_ratio, sum_long_short_ratio FROM symbol_metrics WHERE symbol = ? ORDER BY timestamp", conn, params=(symbol,))
     if not metrics_df.empty:
         metrics_df['met_ts'] = pd.to_datetime(metrics_df['met_ts'], unit='ms').dt.floor('s')
         df = pd.merge_asof(df, metrics_df, left_on='timestamp', right_on='met_ts', direction='backward', tolerance=pd.Timedelta(hours=2))
@@ -58,6 +57,19 @@ def fetch_and_merge_symbol_data(symbol, conn, timeframe='15m'):
         df = pd.merge_asof(df, fund_df, left_on='timestamp', right_on='calc_time', direction='backward', tolerance=pd.Timedelta(hours=16))
     else:
         df['last_funding_rate'] = np.nan
+
+    # 5. Fetch HTF Data (4h)
+    htf_df = pd.read_sql_query("SELECT timestamp as htf_ts, close as htf_close FROM ohlcv WHERE symbol = ? AND timeframe = '4h' ORDER BY timestamp", conn, params=(symbol,))
+    if not htf_df.empty:
+        htf_df['ema_50_4h'] = htf_df['htf_close'].ewm(span=50, adjust=False).mean()
+        htf_df['rsi_4h'] = RSIIndicator(close=htf_df['htf_close'], window=14).rsi()
+        # Prevent Lookahead: A 4h candle that opens at 12:00 closes at 16:00.
+        htf_df['htf_ts'] = pd.to_datetime(htf_df['htf_ts'], unit='ms').dt.floor('s') + pd.Timedelta(hours=4)
+        htf_df['htf_ts'] = htf_df['htf_ts'].astype(df['timestamp'].dtype)
+        df = pd.merge_asof(df, htf_df[['htf_ts', 'ema_50_4h', 'rsi_4h']], left_on='timestamp', right_on='htf_ts', direction='backward')
+    else:
+        df['ema_50_4h'] = np.nan
+        df['rsi_4h'] = 50.0
 
     # C-3 FIX: Bounded forward fill — propagate lower-frequency data (metrics/funding)
     # within a safe window, but never across unfillable gaps
@@ -112,7 +124,77 @@ def add_time_series_features(df, btc_df=None):
     df['day_sin'] = np.sin(2 * np.pi * df['day_of_week_num'] / 7)
     df['day_cos'] = np.cos(2 * np.pi * df['day_of_week_num'] / 7)
 
+    # --- NEW CONTINUOUS FEATURES ---
     
+    # 1. Derivatives Velocity
+    # 4-bar delta (1 hour for 15m candles)
+    df['oi_delta_4'] = df['oi_usd'].pct_change(4)
+    df['funding_delta_4'] = df['funding_rate'].diff(4)
+    
+    # Taker buy/sell ratio
+    df['taker_buy_sell_ratio'] = df.get('sum_taker_long_short_vol_ratio', np.nan)
+    
+    # 2. Momentum & Mean Reversion Refinements
+    ema_50 = df['close'].ewm(span=50, adjust=False).mean()
+    df['distance_from_ema_50'] = (df['close'] - ema_50) / ema_50
+    
+    vol_mean = df['volatility_20'].rolling(100).mean()
+    vol_std = df['volatility_20'].rolling(100).std()
+    df['volatility_zscore'] = (df['volatility_20'] - vol_mean) / (vol_std + 1e-9)
+    
+    vol_ma = df['volume'].rolling(50).mean()
+    vol_sd = df['volume'].rolling(50).std()
+    df['volume_zscore'] = (df['volume'] - vol_ma) / (vol_sd + 1e-9)
+    
+    # 3. Relative Strength (vs BTC)
+    if btc_df is not None and not btc_df.empty:
+        df['ret_12'] = df['close'].pct_change(12)
+        df['btc_ret_12'] = df['btc_close'].pct_change(12)
+        df['relative_strength_btc'] = df['ret_12'] - df['btc_ret_12']
+    else:
+        df['relative_strength_btc'] = 0.0
+        
+    # Sentiment Divergence (Whales vs Retail)
+    top_trader = df.get('sum_toptrader_long_short_ratio', np.nan)
+    global_retail = df.get('sum_long_short_ratio', top_trader)
+    df['sentiment_divergence'] = top_trader - global_retail
+        
+    # 4. Proxy CVD & Divergence
+    candle_range = df['high'] - df['low']
+    candle_range = candle_range.replace(0, 1e-9)
+    delta = df['volume'] * ((df['close'] - df['open']) / candle_range)
+    cvd = delta.cumsum()
+    
+    df['cvd_slope_5'] = cvd.diff(5)
+    
+    # Normalize CVD slope and price return for divergence
+    price_ret_5 = df['close'].pct_change(5)
+    norm_cvd_slope = df['cvd_slope_5'] / (df['volume'].rolling(20).mean() * 5 + 1e-9)
+    df['price_cvd_divergence'] = price_ret_5 - norm_cvd_slope
+
+    # 5. HTF Features & Divergences
+    # Trend Convergence (Micro vs Macro)
+    ema_50_slope = df['close'].ewm(span=50, adjust=False).mean().pct_change(5)
+    ema_50_4h_slope = df.get('ema_50_4h', df['close']).pct_change(16) # 16 * 15m = 4h
+    df['trend_convergence'] = (ema_50_slope * ema_50_4h_slope).fillna(0.0)
+    
+    # BBW Squeeze (Normalized over 100 periods)
+    sma_20 = df['close'].rolling(20).mean()
+    bbw_20 = df['volatility_20'] / (sma_20 + 1e-9)
+    bbw_100_min = bbw_20.rolling(100).min()
+    bbw_100_max = bbw_20.rolling(100).max()
+    df['bbw_squeeze'] = ((bbw_20 - bbw_100_min) / (bbw_100_max - bbw_100_min + 1e-9)).fillna(0.0)
+    
+    # Funding / Basis Divergence
+    fund_100_mean = df['funding_rate'].rolling(100).mean()
+    fund_100_std = df['funding_rate'].rolling(100).std()
+    fund_z = (df['funding_rate'] - fund_100_mean) / (fund_100_std + 1e-9)
+    
+    basis_100_mean = df['basis_pct'].rolling(100).mean()
+    basis_100_std = df['basis_pct'].rolling(100).std()
+    basis_z = (df['basis_pct'] - basis_100_mean) / (basis_100_std + 1e-9)
+    
+    df['funding_basis_divergence'] = (fund_z - basis_z).fillna(0.0)
     # Forward Return (Target Calculation)
     # Default: 6 bars (1.5h for 15m candles, 6h for 1h candles)
     FWD_RETURN_BARS = 6
@@ -126,20 +208,13 @@ def add_time_series_features(df, btc_df=None):
     
     valid_mask = (shifted_ts - df['timestamp']) == expected_delta
     df['fwd_return'] = np.where(valid_mask, shifted_close / df['close'] - 1, np.nan)
-
-    # Strategy Loop
-    # Setting use_htf=False since we don't have htf_trend calculated yet
-    # Using default parameters for strategy initialization
-    for strat_name, strat_info in STRATEGY_CONFIG.items():
-        try:
-            strat_class = strat_info['class']
-            # We initialize with default parameters
-            strat_instance = strat_class()
-            col_name = f"sig_{strat_name}"
-            df[col_name] = strat_instance.get_signal_column(df)
-        except Exception as e:
-            # Some strategies might need specific columns or fail, fallback to 0
-            df[f"sig_{strat_name}"] = 0
+    
+    # Path-dependent metrics for simulator TP/SL
+    fwd_highs = df['high'].iloc[::-1].rolling(window=FWD_RETURN_BARS, min_periods=1).max().iloc[::-1].shift(-1)
+    fwd_lows = df['low'].iloc[::-1].rolling(window=FWD_RETURN_BARS, min_periods=1).min().iloc[::-1].shift(-1)
+    
+    df['fwd_max_ret'] = np.where(valid_mask, fwd_highs / df['close'] - 1, np.nan)
+    df['fwd_min_ret'] = np.where(valid_mask, fwd_lows / df['close'] - 1, np.nan)
             
     return df
 
@@ -194,16 +269,24 @@ def build_mega_dataframe(timeframe='15m'):
     print("Applying cross-sectional ranking...")
     
     # Columns to rank
-    continuous_features = ['rsi', 'macd', 'volatility_20', 'basis_pct', 'oi_usd', 'funding_rate', 'sum_toptrader_long_short_ratio', 'corr_to_index']
+    continuous_features = [
+        'rsi', 'macd', 'volatility_20', 'basis_pct', 'oi_usd', 'funding_rate', 
+        'sum_toptrader_long_short_ratio', 'corr_to_index',
+        'oi_delta_4', 'funding_delta_4', 'taker_buy_sell_ratio', 
+        'distance_from_ema_50', 'volatility_zscore', 'volume_zscore', 'relative_strength_btc',
+        'cvd_slope_5', 'price_cvd_divergence', 'sentiment_divergence',
+        'trend_convergence', 'bbw_squeeze', 'funding_basis_divergence'
+    ]
     
     for col in continuous_features:
-        mega_df[f'rank_{col}'] = mega_df.groupby('timestamp')[col].rank(pct=True)
+        if col in mega_df.columns:
+            mega_df[f'rank_{col}'] = mega_df.groupby('timestamp')[col].rank(pct=True)
         
     # Rank Target
     mega_df['target_rank'] = mega_df.groupby('timestamp')['fwd_return'].rank(pct=True)
     
     # Drop rows where target or critical features are NaN
-    mega_df = mega_df.dropna(subset=['target_rank', 'rank_rsi'])
+    mega_df = mega_df.dropna(subset=['target_rank', 'rank_rsi', 'rank_oi_delta_4'])
     
     return mega_df
 
@@ -217,13 +300,17 @@ def prepare_training_data(mega_df):
     mega_df = mega_df.sort_values('timestamp')
     
     # Define features
-    continuous_features = ['rank_rsi', 'rank_macd', 'rank_volatility_20', 'rank_basis_pct', 'rank_oi_usd', 'rank_funding_rate', 'rank_sum_toptrader_long_short_ratio', 'rank_corr_to_index']
+    continuous_features = [
+        'rank_rsi', 'rank_macd', 'rank_volatility_20', 'rank_basis_pct', 'rank_oi_usd', 
+        'rank_funding_rate', 'rank_sum_toptrader_long_short_ratio', 'rank_corr_to_index',
+        'rank_oi_delta_4', 'rank_funding_delta_4', 'rank_taker_buy_sell_ratio',
+        'rank_distance_from_ema_50', 'rank_volatility_zscore', 'rank_volume_zscore', 'rank_relative_strength_btc',
+        'rank_cvd_slope_5', 'rank_price_cvd_divergence', 'rank_sentiment_divergence',
+        'rank_trend_convergence', 'rank_bbw_squeeze', 'rank_funding_basis_divergence'
+    ]
     time_features = ['hour_sin', 'hour_cos', 'day_sin', 'day_cos']
     
-    # Extract strategy signal columns dynamically
-    strategy_features = [col for col in mega_df.columns if col.startswith('sig_')]
-    
-    features = continuous_features + time_features + strategy_features
+    features = continuous_features + time_features
     
     X = mega_df[features]
     y = mega_df['target_rank']

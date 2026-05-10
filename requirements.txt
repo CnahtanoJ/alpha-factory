@@ -8,4 +8,7 @@ scipy
 boto3
 requests
 hyperliquid-python-sdk
+eth-account
 lightgbm
+xgboost
+optuna

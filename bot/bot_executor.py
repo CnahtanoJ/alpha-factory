@@ -17,7 +17,6 @@ from bot.config import AWS_BUCKET, TESTNET_MODE, BASE_URL
 from bot.utils import S3Interface, send_telegram_message, send_telegram_receipt
 from bot.data_feed import AssetManager, fetch_daily_receipt
 from bot.indicators import get_local_poc, get_cvd_slope
-from bot.strategies import STRATEGY_CONFIG
 from bot.risk_engine import RiskEngine
 from data_pipeline.hyperliquid_sync import (
     get_hl_top_by_volume, 
@@ -26,17 +25,19 @@ from data_pipeline.hyperliquid_sync import (
     get_bulk_latest_candles
 )
 from data_pipeline.database import DB_PATH, get_connection
+from data_pipeline.binance_live import get_bulk_binance_sentiment
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
 class LiveInferenceEngine:
-    def __init__(self, info, conn=None):
+    def __init__(self, info, conn=None, live_sentiment=None):
         self.info = info
         self.conn = conn
+        self.live_sentiment = live_sentiment
 
-    def build_live_features(self, symbol, candles, ctx, index_df=None):
+    def build_live_features(self, symbol, candles, ctx, index_df=None, htf_candles=None):
         if not candles: return None
         df = pd.DataFrame(candles)
         # candles have t, o, h, l, c, v
@@ -84,10 +85,25 @@ class LiveInferenceEngine:
         # Funding rate: training model now uses raw absolute funding rate.
         df['funding_rate'] = float(ctx.get('funding', 0))
 
-        # HL doesn't provide top-trader long/short ratio. This feature will rank
-        # uniformly (all ~0.5) and contribute minimal signal — acceptable since the
-        # training model also saw many NaN-filled values for this feature.
-        df['sum_toptrader_long_short_ratio'] = np.nan
+        # --- LIVE SENTIMENT INJECTION ---
+        top_trader = np.nan
+        global_retail = np.nan
+        
+        if self.live_sentiment and symbol in self.live_sentiment:
+            top_trader = self.live_sentiment[symbol].get('top_long_short')
+            global_retail = self.live_sentiment[symbol].get('global_long_short')
+            
+        df['sum_toptrader_long_short_ratio'] = top_trader
+        df['sum_long_short_ratio'] = global_retail
+        
+        # Fallback logic to match training exactly
+        if pd.isna(global_retail):
+            global_retail = top_trader
+            
+        if pd.notna(top_trader) and pd.notna(global_retail):
+            df['sentiment_divergence'] = top_trader - global_retail
+        else:
+            df['sentiment_divergence'] = 0.0
 
         df['basis_pct'] = (df['close'] - df['final_index_close']) / df['final_index_close']
         
@@ -104,15 +120,88 @@ class LiveInferenceEngine:
         df['macd'] = macd.macd()
         df['volatility_20'] = df['close'].rolling(window=20).std()
         
-        # Strategy loop
-        for strat_name, strat_info in STRATEGY_CONFIG.items():
-            try:
-                strat_class = strat_info['class']
-                strat_instance = strat_class()
-                df[f"sig_{strat_name}"] = strat_instance.get_signal_column(df)
-            except Exception as e:
-                logger.error(f"⚠️ Strategy {strat_name} failed for {symbol}: {e}")
-                df[f"sig_{strat_name}"] = 0
+        # --- NEW CONTINUOUS FEATURES ---
+        
+        # 1. Derivatives Velocity
+        df['oi_delta_4'] = df['oi_usd'].pct_change(4)
+        df['funding_delta_4'] = df['funding_rate'].diff(4)
+        
+        # Live context doesn't easily provide taker buy/sell ratio per symbol without extra API calls,
+        # and we know it's a weak feature in live context, so we pad it.
+        df['taker_buy_sell_ratio'] = np.nan
+        
+        # 2. Momentum & Mean Reversion Refinements
+        ema_50 = df['close'].ewm(span=50, adjust=False).mean()
+        df['distance_from_ema_50'] = (df['close'] - ema_50) / ema_50
+        
+        vol_mean = df['volatility_20'].rolling(100).mean()
+        vol_std = df['volatility_20'].rolling(100).std()
+        df['volatility_zscore'] = (df['volatility_20'] - vol_mean) / (vol_std + 1e-9)
+        
+        vol_ma = df['volume'].rolling(50).mean()
+        vol_sd = df['volume'].rolling(50).std()
+        df['volume_zscore'] = (df['volume'] - vol_ma) / (vol_sd + 1e-9)
+        
+        # 3. Relative Strength (vs BTC)
+        if index_df is not None and not index_df.empty:
+            df['ret_12'] = df['close'].pct_change(12)
+            
+            # Use 'hist_index_close' which was mapped from index_df in earlier step
+            df['btc_ret_12'] = df['hist_index_close'].pct_change(12)
+            df['relative_strength_btc'] = df['ret_12'] - df['btc_ret_12']
+        else:
+            df['relative_strength_btc'] = 0.0
+            
+        # 4. Proxy CVD & Divergence
+        candle_range = df['high'] - df['low']
+        candle_range = candle_range.replace(0, 1e-9)
+        delta = df['volume'] * ((df['close'] - df['open']) / candle_range)
+        cvd = delta.cumsum()
+        
+        df['cvd_slope_5'] = cvd.diff(5)
+        
+        # Normalize CVD slope and price return for divergence
+        price_ret_5 = df['close'].pct_change(5)
+        norm_cvd_slope = df['cvd_slope_5'] / (df['volume'].rolling(20).mean() * 5 + 1e-9)
+        df['price_cvd_divergence'] = price_ret_5 - norm_cvd_slope
+        
+        # 5. HTF Features & Divergences
+        # Trend Convergence
+        ema_50_slope = df['close'].ewm(span=50, adjust=False).mean().pct_change(5)
+        
+        if htf_candles:
+            htf_df = pd.DataFrame(htf_candles)
+            htf_df['timestamp'] = pd.to_datetime(htf_df['timestamp'], unit='ms').dt.floor('s')
+            htf_df = htf_df.sort_values('timestamp').reset_index(drop=True)
+            
+            htf_df['ema_50_4h'] = htf_df['close'].ewm(span=50, adjust=False).mean()
+            htf_df['htf_ts'] = htf_df['timestamp'] + pd.Timedelta(hours=4)
+            htf_df['htf_ts'] = htf_df['htf_ts'].astype(df['timestamp'].dtype)
+            
+            df = pd.merge_asof(df, htf_df[['htf_ts', 'ema_50_4h']], left_on='timestamp', right_on='htf_ts', direction='backward')
+            ema_50_4h_slope = df.get('ema_50_4h', df['close']).pct_change(16)
+        else:
+            ema_50_4h_slope = df['close'].pct_change(16)
+            
+        df['trend_convergence'] = (ema_50_slope * ema_50_4h_slope).fillna(0.0)
+        
+        # BBW Squeeze (Normalized over 100 periods)
+        sma_20 = df['close'].rolling(20).mean()
+        bbw_20 = df['volatility_20'] / (sma_20 + 1e-9)
+        bbw_100_min = bbw_20.rolling(100).min()
+        bbw_100_max = bbw_20.rolling(100).max()
+        df['bbw_squeeze'] = ((bbw_20 - bbw_100_min) / (bbw_100_max - bbw_100_min + 1e-9)).fillna(0.0)
+        
+        # Funding / Basis Divergence
+        fund_100_mean = df['funding_rate'].rolling(100).mean()
+        fund_100_std = df['funding_rate'].rolling(100).std()
+        fund_z = (df['funding_rate'] - fund_100_mean) / (fund_100_std + 1e-9)
+        
+        basis_100_mean = df['basis_pct'].rolling(100).mean()
+        basis_100_std = df['basis_pct'].rolling(100).std()
+        basis_z = (df['basis_pct'] - basis_100_mean) / (basis_100_std + 1e-9)
+        
+        df['funding_basis_divergence'] = (fund_z - basis_z).fillna(0.0)
                 
         return df.iloc[-1:] # Return only the latest row
 
@@ -159,9 +248,12 @@ def executor_handler(event, context):
         top_50_symbols = get_hl_top_by_volume(50)
         live_ctx = get_live_meta_ctx()
         
+        logger.info("🐳 Fetching Live Sentiment from Binance...")
+        live_sentiment = get_bulk_binance_sentiment(top_50_symbols, period="15m")
+        
         db_conn = get_connection()
         
-        engine = LiveInferenceEngine(info, conn=db_conn)
+        engine = LiveInferenceEngine(info, conn=db_conn, live_sentiment=live_sentiment)
         live_rows = []
         
         # 3. 🧠 FEATURE GENERATION
@@ -177,10 +269,12 @@ def executor_handler(event, context):
         
         # Fetch all 50 assets concurrently in batches (takes ~5-10 seconds total)
         bulk_candles = get_bulk_latest_candles(top_50_symbols, interval='15m', limit=100)
+        bulk_htf_candles = get_bulk_latest_candles(top_50_symbols, interval='4h', limit=50)
         
         for sym, candles in bulk_candles.items():
             ctx = live_ctx.get(sym, {})
-            row_df = engine.build_live_features(sym, candles, ctx, index_df=index_df)
+            htf_candles = bulk_htf_candles.get(sym, [])
+            row_df = engine.build_live_features(sym, candles, ctx, index_df=index_df, htf_candles=htf_candles)
             if row_df is not None and not row_df.empty:
                 row_df['symbol'] = sym
                 
@@ -201,14 +295,23 @@ def executor_handler(event, context):
         
         # 4. 🥇 THE LIVE RANKING
         logger.info("⚖️ Applying Cross-Sectional Ranking...")
-        continuous_features = ['rsi', 'macd', 'volatility_20', 'basis_pct', 'oi_usd', 'funding_rate', 'sum_toptrader_long_short_ratio', 'corr_to_index']
+        continuous_features = [
+            'rsi', 'macd', 'volatility_20', 'basis_pct', 'oi_usd', 'funding_rate', 
+            'sum_toptrader_long_short_ratio', 'corr_to_index',
+            'oi_delta_4', 'funding_delta_4', 'taker_buy_sell_ratio', 
+            'distance_from_ema_50', 'volatility_zscore', 'volume_zscore', 'relative_strength_btc',
+            'cvd_slope_5', 'price_cvd_divergence', 'sentiment_divergence',
+            'trend_convergence', 'bbw_squeeze', 'funding_basis_divergence'
+        ]
         
         # Fill NaN with 0 before ranking (NaN would be excluded from rank())
         for col in continuous_features:
-            mega_df[col] = mega_df[col].fillna(0)
+            if col in mega_df.columns:
+                mega_df[col] = mega_df[col].fillna(0)
         
         for col in continuous_features:
-            mega_df[f'rank_{col}'] = mega_df[col].rank(pct=True)
+            if col in mega_df.columns:
+                mega_df[f'rank_{col}'] = mega_df[col].rank(pct=True)
 
         # 5. 🤖 ENSEMBLE INFERENCE
         s3 = S3Interface(AWS_BUCKET)
@@ -228,10 +331,16 @@ def executor_handler(event, context):
                 model_xgb.load_model(xgb_path)
                 
                 # Prepare Features
-                feature_cols = ['rank_rsi', 'rank_macd', 'rank_volatility_20', 'rank_basis_pct', 'rank_oi_usd', 'rank_funding_rate', 'rank_sum_toptrader_long_short_ratio', 'rank_corr_to_index']
+                feature_cols = [
+                    'rank_rsi', 'rank_macd', 'rank_volatility_20', 'rank_basis_pct', 'rank_oi_usd', 
+                    'rank_funding_rate', 'rank_sum_toptrader_long_short_ratio', 'rank_corr_to_index',
+                    'rank_oi_delta_4', 'rank_funding_delta_4', 'rank_taker_buy_sell_ratio',
+                    'rank_distance_from_ema_50', 'rank_volatility_zscore', 'rank_volume_zscore', 'rank_relative_strength_btc',
+                    'rank_cvd_slope_5', 'rank_price_cvd_divergence', 'rank_sentiment_divergence',
+                    'rank_trend_convergence', 'rank_bbw_squeeze', 'rank_funding_basis_divergence'
+                ]
                 time_features = ['hour_sin', 'hour_cos', 'day_sin', 'day_cos']
-                strategy_cols = [col for col in mega_df.columns if col.startswith('sig_')]
-                X_live = mega_df[feature_cols + time_features + strategy_cols]
+                X_live = mega_df[feature_cols + time_features]
                 
                 # Combined Prediction
                 preds_lgb = model_lgb.predict(X_live)
@@ -332,8 +441,8 @@ def executor_handler(event, context):
                     else:
                         logger.warning(f"🛑 SAFETY REJECTION: {target_coin} failed pre-trade checks.")
                 else:
-                    # We already have it. Just sync Breakeven logic.
-                    risk.sync_break_even(target_coin, atr_pct, portfolio, open_orders)
+                    # We already have it. Just sync Trailing Stop logic.
+                    risk.sync_trailing_stop(target_coin, atr_pct, portfolio, open_orders)
                 
         # 3. THE SHIELD
         # Refresh one last time to ensure we have the new positions
