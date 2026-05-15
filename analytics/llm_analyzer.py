@@ -14,12 +14,12 @@ load_dotenv()
 
 SYSTEM_PROMPT = """You are a highly cynical, extremely experienced Quantitative Hedge Fund Risk Manager who specializes in crypto derivatives.
 
-You are reviewing the weekly output of an autonomous AI trading system called "Alpha Factory". This system uses a LightGBM cross-sectional ranking model to rank ~100 crypto futures assets and simulate a market-neutral portfolio (Top 10 Longs, Bottom 10 Shorts).
+You are reviewing the weekly output of an autonomous AI trading system called "Alpha Factory". This system uses a LightGBM cross-sectional ranking model to rank ~100 crypto futures assets and simulate a market-neutral portfolio (Top 5 Longs, Bottom 5 Shorts).
 
 You will receive:
 1. OUT-OF-SAMPLE (OOS) simulation metrics: Sharpe, Profit Factor, Win Rate, Total Return, Max Drawdown. These were generated using LAST week's model on THIS week's data — they are genuinely predictive, not overfit.
 2. FEATURE IMPORTANCE: The model's top drivers ranked by gain. This tells you what market dynamics the model is exploiting.
-3. PER-ASSET DRIVERS: For the Top 10 and Bottom 10 assets, the extreme features that explain why the model ranked them where it did.
+3. PER-ASSET DRIVERS: For the Top 5 and Bottom 5 assets, the extreme features that explain why the model ranked them where it did.
 4. MODEL METADATA: Validation RMSE and Spearman correlation from training.
 5. ROBUSTNESS ANALYSIS (Monte Carlo): Probability of Profit and 95% Confidence Intervals from 2,500+ bootstrap simulations. This tells you if the result is a "chronological fluke."
 
@@ -127,7 +127,7 @@ def build_llm_context(
         lines.append(f"  {feat:45s} {imp:5.1f}% {bar}")
 
     # Section 3: Per-Asset Drivers
-    lines.append("\n## 3. TOP 10 LONGS — Asset Drivers")
+    lines.append("\n## 3. TOP 5 LONGS — Asset Drivers")
     top_symbols = per_asset_drivers.get('top_symbols', [])
     top_drivers = per_asset_drivers.get('top_drivers', {})
     for entry in top_symbols:
@@ -137,7 +137,7 @@ def build_llm_context(
         driver_str = ", ".join([f"{k}: {v}" for k, v in drivers.items()]) if drivers else "No extreme features"
         lines.append(f"  {sym:15s} (rank: {rank:.4f}) → {driver_str}")
 
-    lines.append("\n## 4. BOTTOM 10 SHORTS — Asset Drivers")
+    lines.append("\n## 4. BOTTOM 5 SHORTS — Asset Drivers")
     bottom_symbols = per_asset_drivers.get('bottom_symbols', [])
     bottom_drivers = per_asset_drivers.get('bottom_drivers', {})
     for entry in bottom_symbols:

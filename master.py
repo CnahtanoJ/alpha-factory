@@ -15,6 +15,8 @@ Usage:
 
 import sys
 import os
+from dotenv import load_dotenv
+load_dotenv()
 
 # Fix Windows console encoding (cp1252 can't handle emoji)
 if sys.stdout.encoding != 'utf-8':
@@ -23,13 +25,52 @@ if sys.stdout.encoding != 'utf-8':
 
 import argparse
 import sqlite3
+import json
 from datetime import datetime
 
 # Ensure project root is in path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from data_pipeline.database import DB_PATH
+
+class Tee:
+    """Redirects stdout/stderr to both the console and a file."""
+    def __init__(self, *files):
+        self.files = files
+    def write(self, obj):
+        for f in self.files:
+            f.write(obj)
+            f.flush()
+    def flush(self):
+        for f in self.files:
+            f.flush()
+
 def cmd_ingest(args):
     """Step 1: Download historical data into alpha_factory.db"""
+    # Setup timestamped logging
+    os.makedirs('logs', exist_ok=True)
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H%M")
+    log_file = os.path.join('logs', f"ingest_{timestamp}.log")
+    
+    log_f = open(log_file, 'a', encoding='utf-8')
+    original_stdout = sys.stdout
+    original_stderr = sys.stderr
+    
+    # Start Teeing
+    sys.stdout = Tee(sys.stdout, log_f)
+    sys.stderr = Tee(sys.stderr, log_f)
+    
+    try:
+        print(f"📝 Logging session started: {log_file}")
+        _run_ingest_logic(args)
+    finally:
+        print(f"📝 Logging session finished: {log_file}")
+        sys.stdout = original_stdout
+        sys.stderr = original_stderr
+        log_f.close()
+
+def _run_ingest_logic(args):
+    """The actual ingestion logic, now wrapped in logging."""
     from data_pipeline.database import init_db
     from data_pipeline.sync_manager import SyncManager
     
@@ -76,7 +117,43 @@ def cmd_ingest(args):
     cmd_audit(args)
     
     print("\n✅ Full Data Ingestion, Patching, and Auditing Complete!")
+    
+def save_active_regime(all_results):
+    """
+    Evaluates all timeframe results and saves the best one to live_config.json.
+    """
+    best_tf = None
+    best_sharpe = -float('inf')
+    best_spearman = -float('inf')
 
+    for tf, res in all_results.items():
+        sim = res.get('simulation_results')
+        meta = res.get('model_meta', {})
+        
+        sharpe = sim.get('sharpe', -float('inf')) if sim else -float('inf')
+        spearman = meta.get('validation_spearman', -float('inf'))
+        
+        # Primary sort: Sharpe Ratio. Secondary: Spearman
+        if sharpe > best_sharpe:
+            best_sharpe = sharpe
+            best_spearman = spearman
+            best_tf = tf
+        elif sharpe == best_sharpe and spearman > best_spearman:
+            best_spearman = spearman
+            best_tf = tf
+
+    if best_tf:
+        config_path = os.path.join(os.path.dirname(__file__), 'bot', 'live_config.json')
+        os.makedirs(os.path.dirname(config_path), exist_ok=True)
+        with open(config_path, 'w') as f:
+            json.dump({
+                "active_timeframe": best_tf,
+                "sharpe": float(best_sharpe) if best_sharpe != -float('inf') else 0.0,
+                "spearman": float(best_spearman) if best_spearman != -float('inf') else 0.0,
+                "updated_at": datetime.now().isoformat()
+            }, f, indent=4)
+        print(f"\n👑 REGIME SWITCHER: Selected '{best_tf}' as the optimal timeframe (Sharpe: {best_sharpe:.2f}, Spearman: {best_spearman:.4f})")
+        print(f"   Saved to {config_path}")
 
 def cmd_report(args):
     """Run the Weekly Intelligence Cycle: OOS Simulate → Train → Report"""
@@ -85,17 +162,38 @@ def cmd_report(args):
     from analytics.weekly_orchestrator import run_weekly_cycle
     from analytics.generate_report import generate_report
     
-    print("\n🧠 Running Full Intelligence Cycle...")
-    cycle_results = run_weekly_cycle(
-        market=args.market,
-        force_train=args.force_train,
-        dry_run_weeks=args.dry_run_weeks,
-        optimize=getattr(args, 'optimize', False),
-        n_trials=getattr(args, 'trials', 50)
-    )
+    timeframes = args.timeframe.split(',')
+    # PHASE 4: Enforce 4h-first training order (macro conviction needs 4h model)
+    tf_order = {'4h': 0, '1h': 1, '15m': 2}
+    timeframes = sorted([t.strip() for t in timeframes], key=lambda x: tf_order.get(x, 99))
+    all_results = {}
     
-    print("\n📊 Generating Weekly Intelligence Report...")
-    report_path = generate_report(cycle_results)
+    print(f"\n🧠 Running Full Intelligence Cycle for timeframes: {timeframes}")
+    
+    for tf in timeframes:
+        tf = tf.strip()
+        print(f"\n--- Processing Timeframe: {tf} ---")
+        cycle_results = run_weekly_cycle(
+            market=args.market,
+            timeframe=tf,
+            force_train=args.force_train,
+            dry_run_weeks=args.dry_run_weeks,
+            optimize=getattr(args, 'optimize', False),
+            n_trials=getattr(args, 'trials', 50)
+        )
+        if isinstance(cycle_results, dict) and 'status' not in cycle_results:
+            all_results[tf] = cycle_results
+        else:
+            print(f"⚠️ Skipping {tf} due to training failure or no data.")
+    
+    if not all_results:
+        print("\n❌ No successful cycles completed. Report aborted.")
+        return
+
+    print("\n📊 Generating Aggregated Intelligence Report...")
+    report_path = generate_report(all_results)
+    
+    save_active_regime(all_results)
     
     if report_path:
         print(f"\n✅ Report saved to: {report_path}")
@@ -120,88 +218,128 @@ def cmd_full(args):
     print("="*60)
     
     # 2. Run the intelligence cycle
-    cycle_results = run_weekly_cycle(
-        market=args.market,
-        force_train=args.force_train,
-        dry_run_weeks=args.dry_run_weeks,
-        optimize=getattr(args, 'optimize', False),
-        n_trials=getattr(args, 'trials', 50)
-    )
+    timeframes = args.timeframe.split(',')
+    # PHASE 4: Enforce 4h-first training order (macro conviction needs 4h model)
+    tf_order = {'4h': 0, '1h': 1, '15m': 2}
+    timeframes = sorted([t.strip() for t in timeframes], key=lambda x: tf_order.get(x, 99))
+    all_results = {}
     
-    sim = cycle_results.get('simulation_results')
-    meta = cycle_results.get('model_meta', {})
+    for tf in timeframes:
+        tf = tf.strip()
+        cycle_results = run_weekly_cycle(
+            market=args.market,
+            timeframe=tf,
+            force_train=args.force_train,
+            dry_run_weeks=args.dry_run_weeks,
+            optimize=getattr(args, 'optimize', False),
+            n_trials=getattr(args, 'trials', 50)
+        )
+        if isinstance(cycle_results, dict) and 'status' not in cycle_results:
+            all_results[tf] = cycle_results
+
+    if all_results:
+        print("\n📊 Generating Aggregated Intelligence Report...")
+        generate_report(all_results)
+        save_active_regime(all_results)
     
     print(f"\n✅ AI Intelligence Cycle Complete!")
-    if sim:
-        print(f"   OOS Sharpe: {sim['sharpe']:.2f} | PF: {sim['profit_factor']:.2f} | Win Rate: {sim['win_rate']:.1%}")
-    spearman = meta.get('validation_spearman_correlation', 'N/A')
-    if isinstance(spearman, float):
-        print(f"   Model Spearman ρ: {spearman:.4f}")
-    
-    # 3. Generate the intelligence report
-    print("\n📊 Generating Master Intelligence Report...")
-    report_path = generate_report(cycle_results)
 
 def cmd_status(args):
     """Show what data you have in the local database"""
-    from data_pipeline.database import DB_PATH
-    db_path = DB_PATH
-    
-    if not os.path.exists(db_path):
-        print(f"❌ No database found at {db_path}. Run 'python master.py ingest' first.")
-        return
-    
-    conn = sqlite3.connect(db_path)
-    conn.row_factory = sqlite3.Row
-    
-    # Count total rows
-    total = conn.execute("SELECT COUNT(*) as cnt FROM ohlcv").fetchone()['cnt']
-    
-    if total == 0:
-        print("📭 Database is empty. Run 'python master.py ingest' first.")
-        conn.close()
-        return
-    
-    print(f"\n{'='*60}")
-    print(f"  DATABASE STATUS: alpha_factory.db")
-    print(f"{'='*60}")
-    print(f"  Total candles: {total:,}")
-    
-    # Per-symbol breakdown
-    rows = conn.execute("""
-        SELECT symbol, timeframe, market, 
-               COUNT(*) as candles,
-               MIN(timestamp) as earliest,
-               MAX(timestamp) as latest
-        FROM ohlcv 
-        GROUP BY symbol, timeframe, market
-        ORDER BY candles DESC
-    """).fetchall()
-    
-    print(f"\n  {'Symbol':<15} {'TF':<6} {'Market':<8} {'Candles':>10}   {'From':<12} {'To':<12}")
-    print(f"  {'─'*15} {'─'*6} {'─'*8} {'─'*10}   {'─'*12} {'─'*12}")
-    
-    for r in rows:
-        try:
-            start = datetime.fromtimestamp(r['earliest']/1000).strftime('%Y-%m-%d')
-        except (OSError, ValueError):
-            start = "BAD_TS"
-        try:
-            end = datetime.fromtimestamp(r['latest']/1000).strftime('%Y-%m-%d')
-        except (OSError, ValueError):
-            end = "BAD_TS"
-        print(f"  {r['symbol']:<15} {r['timeframe']:<6} {r['market']:<8} {r['candles']:>10,}   {start:<12} {end:<12}")
-    
-    # Check sync state
-    sync_rows = conn.execute("SELECT COUNT(*) as cnt FROM sync_state").fetchone()['cnt']
-    print(f"\n  Tracked sync states: {sync_rows}")
-    
-    # DB file size
-    size_mb = os.path.getsize(db_path) / (1024 * 1024)
-    print(f"  Database file size: {size_mb:.1f} MB")
-    
-    conn.close()
 
+    print("\n" + "="*60)
+    print("  📊 LOCAL DATABASE STATUS")
+    print("="*60)
+
+    if not os.path.exists(DB_PATH):
+        print(f"❌ Database not found at {DB_PATH}")
+        return
+
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+
+    # Get symbols and timeframes
+    cursor.execute("SELECT symbol, timeframe, COUNT(*) as count, MIN(timestamp), MAX(timestamp) FROM ohlcv GROUP BY symbol, timeframe")
+    rows = cursor.fetchall()
+
+    if not rows:
+        print("📭 Database is empty.")
+    else:
+        print(f"{'Symbol':<15} | {'TF':<5} | {'Rows':<8} | {'Start':<20} | {'End':<20}")
+        print("-" * 75)
+        for row in rows:
+            symbol, tf, count, start, end = row
+            start_dt = datetime.fromtimestamp(start/1000).strftime('%Y-%m-%d')
+            end_dt = datetime.fromtimestamp(end/1000).strftime('%Y-%m-%d')
+            print(f"{symbol:<15} | {tf:<5} | {count:<8,} | {start_dt:<20} | {end_dt:<20}")
+
+    conn.close()
+    print("="*60)
+
+def cmd_health(args):
+    """Verify all sub-account credentials and connectivity"""
+    from hyperliquid.info import Info
+    from bot.config import BASE_URL, AWS_BUCKET
+    from bot.utils import send_telegram_message
+
+    print("\n" + "="*60)
+    print("  🩺 INFRASTRUCTURE HEALTH CHECK")
+    print("="*60)
+
+    timeframes = ['15m', '1h', '4h']
+    info = Info(BASE_URL, skip_ws=True)
+
+    for tf in timeframes:
+        suffix = tf.upper()
+        print(f"\n📡 Checking {tf} Sub-Account...")
+        
+        # Resolve keys (matching bot_executor logic)
+        if os.environ.get("TESTNET_MODE", "False").lower() == "true":
+            key = os.environ.get(f"TESTNET_PRIVATE_KEY_{suffix}", os.environ.get("TESTNET_PRIVATE_KEY"))
+            addr = os.environ.get(f"TESTNET_ACCOUNT_ADDRESS_{suffix}", os.environ.get("TESTNET_ACCOUNT_ADDRESS"))
+            mode = "TESTNET"
+        else:
+            key = os.environ.get(f"MAINNET_PRIVATE_KEY_{suffix}", os.environ.get("MAINNET_PRIVATE_KEY"))
+            addr = os.environ.get(f"MAINNET_ACCOUNT_ADDRESS_{suffix}", os.environ.get("MAINNET_ACCOUNT_ADDRESS"))
+            mode = "MAINNET"
+
+        if not key or not addr:
+            print(f"  ❌ Status: OFFLINE (Missing Keys for _{suffix})")
+            continue
+
+        try:
+            # Try to fetch user state
+            user_state = info.user_state(addr)
+            margin = user_state.get('marginSummary', {}).get('accountValue', '0')
+            print(f"  ✅ Status: ONLINE ({mode})")
+            print(f"  📍 Address: {addr[:6]}...{addr[-4:]}")
+            print(f"  💰 Account Value: ${float(margin):,.2f}")
+        except Exception as e:
+            print(f"  ❌ Status: ERROR (Connection failed: {e})")
+
+    # Check S3
+    print("\n📦 Checking AWS S3 Connectivity...")
+    try:
+        import boto3
+        client = boto3.client('s3')
+        client.list_objects_v2(Bucket=AWS_BUCKET, MaxKeys=1)
+        print(f"  ✅ Status: CONNECTED (Bucket: {AWS_BUCKET})")
+    except Exception as e:
+        print(f"  ❌ Status: FAILED ({e})")
+
+    # Check Telegram
+    print("\n📱 Checking Telegram Bot...")
+    if os.environ.get("TELEGRAM_BOT_TOKEN") and os.environ.get("TELEGRAM_CHAT_ID"):
+        print(f"  ✅ Status: CONFIGURED")
+        if args.ping_telegram:
+            print("  🔔 Sending test message...")
+            send_telegram_message("🩺 *Alpha Factory Health Check*: Connectivity Verified.")
+    else:
+        print("  ⚠️ Status: NOT CONFIGURED")
+
+    print("\n" + "="*60)
+    print("  ✅ HEALTH CHECK COMPLETE")
+    print("="*60)
 
 def cmd_audit(args):
     """Diagnose data integrity: gaps, spikes, and health scores."""
@@ -290,6 +428,8 @@ Recommended first-time workflow:
     def add_ml_args(p):
         p.add_argument('--market', choices=['futures'], default='futures',
                        help='Which market data to train on (default: futures)')
+        p.add_argument('--timeframe', default='15m,1h,4h', 
+                       help='Comma-separated timeframes to run report on (default: 15m,1h,4h)')
         p.add_argument('--force-train', '--force', action='store_true', dest='force_train',
                        help='Force retraining the model even if a cached version exists')
         p.add_argument('--dry-run-weeks', type=int, default=4, dest='dry_run_weeks',
@@ -312,8 +452,6 @@ Recommended first-time workflow:
                           help='Symbols to ingest if bootstrapping')
     p_full.add_argument('--top', type=int, default=0,
                           help='Auto-discover top N symbols to bootstrap')
-    p_full.add_argument('--timeframe', default='15m,1h,4h', 
-                          help='Timeframes to ingest (default: 15m,1h,4h)')
     p_full.add_argument('--years', type=int, default=3, 
                           help='Years of history to fetch (default: 3)')
     p_full.add_argument('--start-year', type=int, default=2020, dest='start_year',
@@ -331,6 +469,12 @@ Recommended first-time workflow:
     # ── status ──
     p_status = subparsers.add_parser('status', help='Check database contents')
     p_status.set_defaults(func=cmd_status)
+    
+    # ── health ──
+    p_health = subparsers.add_parser('health', help='Verify all sub-account credentials and connectivity')
+    p_health.add_argument('--ping', action='store_true', dest='ping_telegram',
+                          help='Send a test message to Telegram if configured')
+    p_health.set_defaults(func=cmd_health)
     
     args = parser.parse_args()
     

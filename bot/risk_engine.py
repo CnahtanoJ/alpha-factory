@@ -486,7 +486,7 @@ class RiskEngine:
         # 3. Place NEW Unified SL (Trailing Initial)
         logger.info(f"🛡️ PLACING INITIAL SL: Total {total_sz} @ {avg_entry} | ATR: {current_atr_pct:.2%}")
         
-        sl_mult = 2.0
+        sl_mult = 1.0
         hard_sl_pct = current_atr_pct * sl_mult
         d = 1 if is_buy_pos else -1
         sl_px = self.assets.get_price_precision(coin, avg_entry * (1 - (hard_sl_pct * d)))
@@ -562,7 +562,7 @@ class RiskEngine:
                 self.memory.set(coin, 'soft_warned', True)
 
         # 2. 📈 RATCHETING TRAILING STOP
-        trail_dist = current_atr_pct * 2.0
+        trail_dist = current_atr_pct * 1.0
         d = 1 if is_long else -1
         
         # Calculate new potential SL

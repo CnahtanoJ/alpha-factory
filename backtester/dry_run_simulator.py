@@ -32,9 +32,11 @@ def simulate_portfolio(
     fee_rate: float = DEFAULT_TAKER_FEE,
     slippage: float = DEFAULT_SLIPPAGE,
     timeframe: str = '1h',
-    weighting_mode: str = 'equal', # 'equal' or 'risk_parity'
+    weighting_mode: str = 'equal',
     mc_sims: int = 2500,
-    hysteresis_factor: float = 5.0,
+    hysteresis_factor: float = 4.0, # agile conviction mode
+    long_atr_multiplier: float = 1.0,
+    short_atr_multiplier: float = 1.0,
 ) -> dict:
     """
     Vectorized long/short portfolio simulation from LightGBM predictions.
@@ -69,7 +71,7 @@ def simulate_portfolio(
     df['predicted_rank'] = predictions
 
     # P1-7: Log rebalance cadence for transparency
-    print(f"📊 Rebalance cadence: every {rebalance_freq} bars | Hysteresis buffer: {hysteresis_factor:.1f}x")
+    print(f"Rebalance cadence: every {rebalance_freq} bars | Hysteresis buffer: {hysteresis_factor:.1f}x")
 
     # ─── Group by timestamp to get cross-sectional snapshots ───
     timestamps = np.sort(df['timestamp'].unique())
@@ -118,27 +120,37 @@ def simulate_portfolio(
         curr_shorts = set(shorts['symbol'])
 
         # ─── VECTORIZED TRAILING STOP LOGIC ───
-        # Trailing distance = 2.0x ATR
-        long_trail_dist = longs['atr_pct'] * 2.0
+        # Trailing distance = multiplier * ATR
+        long_trail_dist = longs['atr_pct'] * long_atr_multiplier
         
-        long_initial_sl_hit = longs['fwd_min_ret'] <= -long_trail_dist
-        long_retrace_hit = (longs['fwd_max_ret'] - longs['fwd_return']) >= long_trail_dist
+        # M-4 FIX: NaN Guard for trailing stop inputs
+        long_fwd_min = longs['fwd_min_ret'].fillna(0)
+        long_fwd_max = longs['fwd_max_ret'].fillna(0)
+        long_fwd_ret = longs['fwd_return'].fillna(0)
+
+        long_initial_sl_hit = long_fwd_min <= -long_trail_dist
+        long_retrace_hit = (long_fwd_max - long_fwd_ret) >= long_trail_dist
         
         # Conservative: If initial SL hit, we take the full loss. Else, check if it retraced from the peak.
         long_actual_returns = np.where(
             long_initial_sl_hit, -long_trail_dist,
-            np.where(long_retrace_hit, longs['fwd_max_ret'] - long_trail_dist, longs['fwd_return'])
+            np.where(long_retrace_hit, long_fwd_max - long_trail_dist, long_fwd_ret)
         )
 
-        short_trail_dist = shorts['atr_pct'] * 2.0
+        short_trail_dist = shorts['atr_pct'] * short_atr_multiplier
         
-        short_initial_sl_hit = shorts['fwd_max_ret'] >= short_trail_dist
-        short_retrace_hit = (shorts['fwd_return'] - shorts['fwd_min_ret']) >= short_trail_dist
+        # M-4 FIX: NaN Guard for trailing stop inputs
+        short_fwd_min = shorts['fwd_min_ret'].fillna(0)
+        short_fwd_max = shorts['fwd_max_ret'].fillna(0)
+        short_fwd_ret = shorts['fwd_return'].fillna(0)
+
+        short_initial_sl_hit = short_fwd_max >= short_trail_dist
+        short_retrace_hit = (short_fwd_max - short_fwd_min) >= short_trail_dist
         
         # Simulated price movement of the underlying asset
         short_sim_move = np.where(
             short_initial_sl_hit, short_trail_dist,
-            np.where(short_retrace_hit, shorts['fwd_min_ret'] + short_trail_dist, shorts['fwd_return'])
+            np.where(short_retrace_hit, short_fwd_min + short_trail_dist, short_fwd_ret)
         )
 
         # ─── RETURN CALCULATION ───
@@ -229,7 +241,10 @@ def simulate_portfolio(
     annual_factor = tf_map.get(timeframe, 8760)
     
     bars_per_year = annual_factor / rebalance_freq
-    sharpe = (net_series.mean() / (net_series.std() + 1e-9)) * np.sqrt(bars_per_year)
+    if len(net_series) < 2:
+        sharpe = 0.0
+    else:
+        sharpe = (net_series.mean() / (net_series.std() + 1e-9)) * np.sqrt(bars_per_year)
 
     # Profit factor
     gross_profit = net_series[net_series > 0].sum()

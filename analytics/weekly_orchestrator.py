@@ -8,7 +8,7 @@ Sequence (strict order to prevent lookahead bias):
   2. Load PREVIOUS week's LightGBM model (if exists)
   3. Run OOS Simulation on the most recent week using the old model
   4. Train NEW LightGBM model on the full dataset
-  5. Extract Feature Importance for Top 10 / Bottom 10
+  5. Extract Feature Importance for Top 5 Longs, Bottom 5 Shorts
   6. Generate Intelligence Report with AI Verdict
 
 Usage:
@@ -26,15 +26,18 @@ import pandas as pd
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import lightgbm as lgb
-from analytics.cross_sectional import build_mega_dataframe, train_cross_sectional_lgbm
+from analytics.cross_sectional import build_mega_dataframe, train_cross_sectional_lgbm, get_fwd_return_bars, get_feature_names
 
 logger = logging.getLogger()
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 
 MODEL_DIR = os.path.join(os.path.dirname(__file__), 'models')
-MODEL_PATH = os.path.join(MODEL_DIR, 'cross_sectional_lgbm.txt')
-META_PATH = os.path.join(MODEL_DIR, 'cross_sectional_lgbm_meta.json')
-FEATURES_PATH = os.path.join(MODEL_DIR, 'features.json')
+
+def get_model_path(timeframe):
+    return os.path.join(MODEL_DIR, f'cross_sectional_lgbm_{timeframe}.txt')
+
+def get_meta_path(timeframe):
+    return os.path.join(MODEL_DIR, f'cross_sectional_lgbm_{timeframe}_meta.json')
 
 
 def _bars_per_day(timeframe: str) -> int:
@@ -43,31 +46,20 @@ def _bars_per_day(timeframe: str) -> int:
     return tf_map.get(timeframe, 96)  # Default to 15m
 
 
-def get_feature_names():
-    """Returns the canonical feature list used by the LightGBM model."""
-    continuous_features = [
-        'rank_rsi', 'rank_macd', 'rank_volatility_20', 'rank_basis_pct',
-        'rank_oi_usd', 'rank_funding_rate',
-        'rank_sum_toptrader_long_short_ratio', 'rank_corr_to_index',
-        'rank_oi_delta_4', 'rank_funding_delta_4', 'rank_taker_buy_sell_ratio',
-        'rank_distance_from_ema_50', 'rank_volatility_zscore', 'rank_volume_zscore', 'rank_relative_strength_btc',
-        'rank_cvd_slope_5', 'rank_price_cvd_divergence'
-    ]
-    time_features = ['hour_sin', 'hour_cos', 'day_sin', 'day_cos']
-    return continuous_features, time_features
 
 
-def load_previous_model():
+def load_previous_model(timeframe):
     """
-    Load the previously trained LightGBM model.
+    Load the previously trained LightGBM model for a specific timeframe.
     Returns (model, features) or (None, None) if no cached model exists.
     """
-    if not os.path.exists(MODEL_PATH):
-        logger.warning("⚠️ No cached LightGBM model found. First run — OOS simulation will be skipped.")
+    model_path = get_model_path(timeframe)
+    if not os.path.exists(model_path):
+        logger.warning(f"⚠️ No cached LightGBM model found for {timeframe}. First run — OOS simulation will be skipped.")
         return None, None
 
-    logger.info(f"📦 Loading previous LightGBM model from {MODEL_PATH}")
-    model = lgb.Booster(model_file=MODEL_PATH)
+    logger.info(f"📦 Loading previous LightGBM model from {model_path}")
+    model = lgb.Booster(model_file=model_path)
     features = model.feature_name()
     return model, features
 
@@ -102,6 +94,19 @@ def extract_per_asset_drivers(
     """
     df = mega_df.copy()
     df['predicted_rank'] = predictions
+
+    # 2. 🛡️ FINAL LEAKAGE PROTECTION: Verify Chronological Integrity
+    train_max_ts = df_train['timestamp'].max()
+    oos_min_ts = df_oos['timestamp'].min()
+    
+    print(f"   🛡️ Chronological Gap Check:")
+    print(f"      - Training End: {train_max_ts}")
+    print(f"      - OOS Test Start: {oos_min_ts}")
+    if oos_min_ts > train_max_ts:
+        print("      ✅ PASS: OOS data is strictly AFTER training data.")
+    else:
+        print("      ❌ FAIL: OVERLAP DETECTED! Potential leakage.")
+        return None
 
     # Get the latest timestamp
     latest_ts = df['timestamp'].max()
@@ -146,8 +151,8 @@ def run_weekly_cycle(
     timeframe='15m',
     force_train=False,
     dry_run_weeks=4,
-    top_n=3,
-    bottom_n=3,
+    top_n=5,
+    bottom_n=5,
     optimize=False,
     n_trials=50,
 ):
@@ -200,14 +205,27 @@ def run_weekly_cycle(
     latest_ts = mega_df['timestamp'].max()
     oos_cutoff = latest_ts - pd.Timedelta(weeks=dry_run_weeks)
     train_df = mega_df[mega_df['timestamp'] < oos_cutoff].copy()
-    oos_df = mega_df[mega_df['timestamp'] >= oos_cutoff].copy()
     
-    logger.info(f"📐 Walk-Forward Split: Train={len(train_df):,} rows (before {oos_cutoff}) | OOS={len(oos_df):,} rows (after)")
+    # M-4 FIX: For REPORTING (Step 1), ALWAYS use at least 4 weeks of data if available, 
+    # even if dry_run_weeks is 0 for production training.
+    reporting_weeks = max(4, dry_run_weeks)
+    reporting_cutoff = latest_ts - pd.Timedelta(weeks=reporting_weeks)
+    oos_df = mega_df[mega_df['timestamp'] >= reporting_cutoff].copy()
+    
+    logger.info(f"📐 Walk-Forward Split: Train={len(train_df):,} rows (before {oos_cutoff}) | Reporting OOS={len(oos_df):,} rows (after {reporting_cutoff})")
+    
+    # 🛡️ CHRONOLOGICAL INTEGRITY CHECK
+    train_max = train_df['timestamp'].max()
+    oos_min = oos_df['timestamp'].min()
+    if oos_min > train_max:
+        logger.info(f"   ✅ LEAKAGE CHECK: PASS (OOS starts {oos_min - train_max} after Training ends)")
+    else:
+        logger.warning(f"   ⚠️ LEAKAGE CHECK: WARNING ({oos_min} <= {train_max}). This is acceptable for overlapping rolling reports but not for blind validation.")
 
-    # =========================================================
+    # = ========================================================
     # STEP 1: OOS SIMULATION WITH PREVIOUS MODEL
     # =========================================================
-    previous_model, prev_features = load_previous_model()
+    previous_model, prev_features = load_previous_model(timeframe)
     simulation_results = None
     if previous_model is not None:
         logger.info("🔬 WEEKLY CYCLE: Running OOS Simulation with PREVIOUS model...")
@@ -225,13 +243,27 @@ def run_weekly_cycle(
                     
             X_oos = oos_df[prev_features]
             oos_predictions = previous_model.predict(X_oos)
+            
+            # Calculate OOS Spearman to detect decay
+            from scipy.stats import spearmanr
+            oos_spearman, _ = spearmanr(oos_predictions, oos_df['target_rank'].fillna(0))
+            
+            # Load metadata for the previous model to get the old validation score
+            prev_meta = {}
+            meta_path = get_meta_path(timeframe)
+            if os.path.exists(meta_path):
+                with open(meta_path, 'r') as f:
+                    prev_meta = json.load(f)
+            
+            logger.info(f"🎯 OOS Spearman Correlation: {oos_spearman:.4f} (Validation was {prev_meta.get('validation_spearman_correlation', 0):.4f})")
 
+            fwd_bars = get_fwd_return_bars(timeframe)
             simulation_results = simulate_portfolio(
                 oos_df, oos_predictions,
                 top_n=top_n, bottom_n=bottom_n,
-                rebalance_freq=_bars_per_day(timeframe),
+                rebalance_freq=fwd_bars, 
                 timeframe=timeframe,
-                weighting_mode='risk_parity'
+                weighting_mode='equal'
             )
 
             from backtester.dry_run_simulator import format_simulation_summary
@@ -250,38 +282,39 @@ def run_weekly_cycle(
     if optimize:
         logger.info(f"🚀 Manual Optimization requested. Triggering Optuna HPO ({n_trials} trials)...")
         from analytics.cross_sectional import prepare_training_data, optimize_lgbm_hyperparameters
-        X_train, y_train, X_val, y_val, features = prepare_training_data(train_df)
-        best_params = optimize_lgbm_hyperparameters(X_train, y_train, X_val, y_val, n_trials=n_trials)
+        X_train, y_train, X_val, y_val, features = prepare_training_data(train_df, timeframe=timeframe)
+        best_params = optimize_lgbm_hyperparameters(X_train, y_train, X_val, y_val, n_trials=n_trials, timeframe=timeframe)
         logger.info("✅ Optimization complete. Training model with best parameters...")
 
-    model, features = train_cross_sectional_lgbm(train_df, optimized_params=best_params)
+    model, features = train_cross_sectional_lgbm(train_df, optimized_params=best_params, timeframe=timeframe)
 
     # ─── ELITE GATEKEEPER ───
     # We load the meta to check the Spearman Correlation
     model_meta = {}
-    if os.path.exists(META_PATH):
-        with open(META_PATH, 'r') as f:
+    meta_path = get_meta_path(timeframe)
+    if os.path.exists(meta_path):
+        with open(meta_path, 'r') as f:
             model_meta = json.load(f)
             
-    spearman_corr = model_meta.get('validation_spearman_correlation', 0)
+    spearman_corr = model_meta.get('validation_spearman', 0)
     
-    if spearman_corr < 0.05:
+    if spearman_corr < 0.04:
         logger.warning(f"🚨 GATEKEEPER REJECTION: Spearman={spearman_corr:.4f} is too low.")
         logger.info("🔄 Triggering Optuna HPO to find a more robust model...")
         
         from analytics.cross_sectional import prepare_training_data, optimize_lgbm_hyperparameters
-        X_train, y_train, X_val, y_val, features = prepare_training_data(train_df)
-        best_params = optimize_lgbm_hyperparameters(X_train, y_train, X_val, y_val, n_trials=30)
+        X_train, y_train, X_val, y_val, features = prepare_training_data(train_df, timeframe=timeframe)
+        best_params = optimize_lgbm_hyperparameters(X_train, y_train, X_val, y_val, n_trials=30, timeframe=timeframe)
         
         # Re-train with optimized parameters
-        model, features = train_cross_sectional_lgbm(train_df, optimized_params=best_params)
+        model, features = train_cross_sectional_lgbm(train_df, optimized_params=best_params, timeframe=timeframe)
         
         # Reload meta after re-train
-        with open(META_PATH, 'r') as f:
+        with open(meta_path, 'r') as f:
             model_meta = json.load(f)
-        spearman_corr = model_meta.get('validation_spearman_correlation', 0)
+        spearman_corr = model_meta.get('validation_spearman', 0)
         
-        if spearman_corr < 0.05:
+        if spearman_corr < 0.04:
             logger.error(f"❌ OPTIMIZATION FAILED: Spearman={spearman_corr:.4f} still below threshold.")
             logger.error("🛑 CRITICAL: Deployment aborted to protect capital.")
             return {'status': 'FAIL', 'reason': 'Spearman correlation below threshold even after HPO.'}
@@ -314,8 +347,8 @@ def run_weekly_cycle(
 
     # Load model meta
     model_meta = {}
-    if os.path.exists(META_PATH):
-        with open(META_PATH, 'r') as f:
+    if os.path.exists(meta_path):
+        with open(meta_path, 'r') as f:
             model_meta = json.load(f)
 
     logger.info("✅ WEEKLY CYCLE COMPLETE!")

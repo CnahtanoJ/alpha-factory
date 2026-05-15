@@ -9,9 +9,60 @@ import xgboost as xgb
 import optuna
 import gc
 from scipy.stats import spearmanr
+from sklearn.linear_model import Ridge
+import joblib
 from ta.momentum import RSIIndicator
 from ta.trend import MACD
 from data_pipeline.database import DB_PATH
+
+# --- CANONICAL FEATURE SETS (Single Source of Truth) ---
+RAW_CONTINUOUS = [
+    'rsi', 'macd', 'volatility_20', 'basis_pct', 'oi_usd', 'funding_rate', 
+    'sum_toptrader_long_short_ratio', 'corr_to_index',
+    'oi_delta_4', 'funding_delta_4', 'sum_toptrader_ls_delta_4',
+    'distance_from_ema_50', 'volatility_zscore', 
+    'volume_zscore', 'relative_strength_btc',
+    'cvd_slope_5', 'price_cvd_divergence', 'sentiment_divergence',
+    'trend_convergence', 'bbw_squeeze', 'funding_basis_divergence',
+    'vol_volatility_ratio', 'market_beta', 'rsi_divergence', 'vpt_slope',
+    'range_expansion', 'net_taker_volume_zscore',
+    # NEW PHASE 2 DELTA FEATURES
+    'rsi_delta_4', 'macd_delta_4', 'volatility_delta_4', 'volume_delta_4',
+    'oi_change_pct_12', 'funding_acceleration'
+]
+
+FULL_CONTINUOUS = [f'rank_{f}' for f in RAW_CONTINUOUS]
+
+PRUNED_CONTINUOUS = [
+    'rank_rsi', 'rank_macd', 'rank_volatility_20', 'rank_basis_pct', 'rank_oi_usd', 
+    'rank_funding_rate', 'rank_sum_toptrader_long_short_ratio', 'rank_corr_to_index',
+    'rank_oi_delta_4', 'rank_distance_from_ema_50', 'rank_volatility_zscore', 
+    'rank_volume_zscore', 'rank_relative_strength_btc',
+    'rank_cvd_slope_5', 'rank_price_cvd_divergence', 'rank_sentiment_divergence',
+    'rank_trend_convergence', 'rank_bbw_squeeze', 'rank_funding_basis_divergence',
+    'rank_vol_volatility_ratio', 'rank_market_beta', 'rank_rsi_divergence', 'rank_vpt_slope'
+]
+
+FULL_TIME = ['hour_sin', 'hour_cos', 'day_sin', 'day_cos']
+PRUNED_TIME = ['day_sin', 'day_cos']
+
+# NEW PHASE 2 MARKET REGIME FEATURES (Unranked)
+MARKET_REGIME_BASE = ['btc_ret_24', 'btc_volatility_24', 'market_breadth', 'regime_score']
+MARKET_REGIME_MACRO = ['macro_conviction_4h']  # Only for 15m/1h (injected from 4h model)
+
+def get_feature_names(timeframe='15m'):
+    """Returns the canonical feature list used by the LightGBM model for a given timeframe."""
+    if timeframe == '4h':
+        cont, time = PRUNED_CONTINUOUS, PRUNED_TIME
+    else:
+        cont, time = FULL_CONTINUOUS, FULL_TIME
+    
+    # Include Market Regime features
+    regime = MARKET_REGIME_BASE[:]
+    if timeframe != '4h':
+        regime += MARKET_REGIME_MACRO
+    
+    return cont + regime, time
 
 try:
     import boto3
@@ -21,7 +72,21 @@ except ImportError:
     AWS_BUCKET = None
 
 MODEL_DIR = os.path.join(os.path.dirname(__file__), 'models')
-PARAMS_PATH = os.path.join(MODEL_DIR, 'best_params.json')
+
+def get_params_path(timeframe):
+    return os.path.join(MODEL_DIR, f'best_params_{timeframe}.json')
+
+def get_fwd_return_bars(timeframe):
+    """
+    Returns the target prediction horizon (in bars) for a given timeframe.
+    """
+    mapping = {
+        '15m': 12, # 3 hours
+        '1h': 12,  # 12 hours
+        '4h': 12,  # 48 hours
+    }
+    return mapping.get(timeframe, 6) # Default to 6 if unknown
+
 def fetch_and_merge_symbol_data(symbol, conn, timeframe='15m'):
     """
     Fetches ohlcv, index_ohlcv, symbol_metrics, and funding_rate for a single symbol
@@ -146,13 +211,21 @@ def add_time_series_features(df, btc_df=None):
     vol_sd = df['volume'].rolling(50).std()
     df['volume_zscore'] = (df['volume'] - vol_ma) / (vol_sd + 1e-9)
     
-    # 3. Relative Strength (vs BTC)
+    # 3. Relative Strength (vs BTC) & Market Beta
     if btc_df is not None and not btc_df.empty:
         df['ret_12'] = df['close'].pct_change(12)
         df['btc_ret_12'] = df['btc_close'].pct_change(12)
         df['relative_strength_btc'] = df['ret_12'] - df['btc_ret_12']
+        
+        # Phase 5: Market Beta
+        asset_ret_1 = df['close'].pct_change()
+        btc_ret_1 = df['btc_close'].pct_change()
+        cov = asset_ret_1.rolling(20).cov(btc_ret_1)
+        var = btc_ret_1.rolling(20).var()
+        df['market_beta'] = (cov / (var + 1e-9)).fillna(0.0)
     else:
         df['relative_strength_btc'] = 0.0
+        df['market_beta'] = 0.0
         
     # Sentiment Divergence (Whales vs Retail)
     top_trader = df.get('sum_toptrader_long_short_ratio', np.nan)
@@ -195,28 +268,197 @@ def add_time_series_features(df, btc_df=None):
     basis_z = (df['basis_pct'] - basis_100_mean) / (basis_100_std + 1e-9)
     
     df['funding_basis_divergence'] = (fund_z - basis_z).fillna(0.0)
+
+    # 6. Phase 5 Features (Parity Fix)
+    vol_ma_20 = df['volume'].rolling(20).mean()
+    
+    # Volume to Volatility Ratio (Matched to Bot)
+    df['vol_volatility_ratio'] = (vol_ma_20 / (df['volatility_20'] + 1e-9)).fillna(0.0)
+    
+    # RSI Divergence Proxy (Matched to Bot: RSI Momentum vs Price Momentum)
+    df['rsi_divergence'] = df['rsi'].diff(5) - df['close'].pct_change(5)
+    
+    # VPT Slope (Volume Price Trend)
+    vpt = (df['volume'] * df['close'].pct_change()).cumsum()
+    df['vpt_slope'] = vpt.diff(5) / (vol_ma_20 + 1e-9)
+    
+    # Range Expansion
+    df['range_expansion'] = (df['high'] - df['low']) / (df['volatility_20'] + 1e-9)
+    
+    # Top Trader Delta
+    df['sum_toptrader_ls_delta_4'] = df['sum_toptrader_long_short_ratio'].diff(4)
+    
+    # Net Taker Volume Z-score Proxy (from CVD delta)
+    df['net_taker_volume_zscore'] = (df['cvd_slope_5'] / (vol_ma_20 + 1e-9)).fillna(0.0)
+    
+
+    # --- NEW PHASE 2 DELTA FEATURES ---
+    df['rsi_delta_4'] = df['rsi'].diff(4)
+    df['macd_delta_4'] = df['macd'].diff(4)
+    df['volatility_delta_4'] = df['volatility_20'].diff(4)
+    df['volume_delta_4'] = df['volume'].pct_change(4)
+    df['oi_change_pct_12'] = df['oi_usd'].pct_change(12)
+    df['funding_acceleration'] = df['funding_delta_4'].diff(1)
+    
     # Forward Return (Target Calculation)
-    # Default: 6 bars (1.5h for 15m candles, 6h for 1h candles)
-    FWD_RETURN_BARS = 6
+    # Dynamic horizon based on timeframe
+    tf_val = df['timeframe_name'].iloc[0] if 'timeframe_name' in df.columns else '15m'
+    fwd_bars = get_fwd_return_bars(tf_val)
     
     # Safely compute fwd_return avoiding gaps
     tf_timedelta = df['timestamp'].diff().mode()[0]
-    expected_delta = tf_timedelta * FWD_RETURN_BARS
+    expected_delta = tf_timedelta * fwd_bars
     
-    shifted_close = df['close'].shift(-FWD_RETURN_BARS)
-    shifted_ts = df['timestamp'].shift(-FWD_RETURN_BARS)
+    shifted_close = df['close'].shift(-fwd_bars)
+    shifted_ts = df['timestamp'].shift(-fwd_bars)
     
     valid_mask = (shifted_ts - df['timestamp']) == expected_delta
-    df['fwd_return'] = np.where(valid_mask, shifted_close / df['close'] - 1, np.nan)
+    raw_fwd = shifted_close / df['close'] - 1
+    
+    # PHASE 3 FIX: Risk-Adjusted Target (Return / ATR)
+    # We store it in a separate column to avoid corrupting the backtester's price data
+    df['fwd_return'] = np.where(valid_mask, raw_fwd, np.nan)
+    df['risk_adj_ret'] = np.where(valid_mask, raw_fwd / (df['atr_pct'] + 1e-9), np.nan)
     
     # Path-dependent metrics for simulator TP/SL
-    fwd_highs = df['high'].iloc[::-1].rolling(window=FWD_RETURN_BARS, min_periods=1).max().iloc[::-1].shift(-1)
-    fwd_lows = df['low'].iloc[::-1].rolling(window=FWD_RETURN_BARS, min_periods=1).min().iloc[::-1].shift(-1)
+    fwd_highs = df['high'].iloc[::-1].rolling(window=fwd_bars, min_periods=1).max().iloc[::-1].shift(-1)
+    fwd_lows = df['low'].iloc[::-1].rolling(window=fwd_bars, min_periods=1).min().iloc[::-1].shift(-1)
     
     df['fwd_max_ret'] = np.where(valid_mask, fwd_highs / df['close'] - 1, np.nan)
     df['fwd_min_ret'] = np.where(valid_mask, fwd_lows / df['close'] - 1, np.nan)
             
     return df
+
+def inject_macro_conviction(mega_df, timeframe):
+    """Inject 4h model predictions as a macro conviction feature for 15m/1h models."""
+    if timeframe == '4h':
+        mega_df['macro_conviction_4h'] = 0.0
+        return mega_df
+    
+    # 1. Check if we are in "Live/OOS Mode" or "Training Mode"
+    unique_ts = sorted(mega_df['timestamp'].unique())
+    is_training = len(unique_ts) > 500 # Threshold to distinguish live/OOS from full training
+    
+    if not is_training:
+        # LIVE/OOS MODE: Use the existing production 4h model
+        lgb_path = os.path.join(MODEL_DIR, 'cross_sectional_lgbm_4h.txt')
+        if not os.path.exists(lgb_path):
+            mega_df['macro_conviction_4h'] = 0.0
+            return mega_df
+        
+        print(f"🔮 Live/OOS Mode: Injecting Macro Conviction using production 4h model...")
+        model_4h = lgb.Booster(model_file=lgb_path)
+        mega_4h = build_mega_dataframe('4h') # This build is small in live mode
+        if mega_4h.empty:
+            mega_df['macro_conviction_4h'] = 0.0
+            return mega_df
+        
+        X_4h = mega_4h[model_4h.feature_name()].fillna(0.0)
+        pred_df = mega_4h[['timestamp', 'symbol']].copy()
+        pred_df['macro_conviction_4h'] = model_4h.predict(X_4h).astype(np.float32)
+        
+        return _merge_macro_preds(mega_df, pred_df)
+
+    # 2. TRAINING MODE: 3-Fold Walk-Forward to prevent Leakage
+    print(f"🛡️ Training Mode: Implementing 3-Fold Walk-Forward OOF Injection (Leak-Free)...")
+    
+    # We need the full 4h data to train our "mini" models
+    mega_4h = build_mega_dataframe('4h')
+    if mega_4h.empty:
+        mega_df['macro_conviction_4h'] = 0.0
+        return mega_df
+        
+    # Split timestamps into 3 chunks
+    ts_splits = np.array_split(unique_ts, 3)
+    p1_ts, p2_ts, p3_ts = ts_splits[0], ts_splits[1], ts_splits[2]
+    
+    # Containers for predictions
+    all_macro_preds = []
+    
+    # FOLD 1 (Part 1): Train on P1, Predict on P1 (Self-prediction to avoid zero-fuel cold start)
+    print("   [Fold 1/3] Warming up: Self-prediction for Part 1...")
+    df_train_p1 = mega_4h[mega_4h['timestamp'].isin(p1_ts)]
+    model_p1, feats_p1 = train_mini_4h(df_train_p1)
+    if model_p1:
+        p1_preds = df_train_p1[['timestamp', 'symbol']].copy()
+        p1_preds['macro_conviction_4h'] = model_p1.predict(df_train_p1[feats_p1].fillna(0.0))
+        all_macro_preds.append(p1_preds)
+    
+    # FOLD 2 (Part 2): Train on P1, Predict on P2
+    print("   [Fold 2/3] Training on 33%, Predicting next 33%...")
+    df_train_f1 = mega_4h[mega_4h['timestamp'].isin(p1_ts)]
+    df_test_f1 = mega_4h[mega_4h['timestamp'].isin(p2_ts)]
+    
+    model_f1, feats_f1 = train_mini_4h(df_train_f1)
+    if model_f1:
+        f1_preds = df_test_f1[['timestamp', 'symbol']].copy()
+        f1_preds['macro_conviction_4h'] = model_f1.predict(df_test_f1[feats_f1].fillna(0.0))
+        all_macro_preds.append(f1_preds)
+    
+    # FOLD 3 (Part 3): Train on P1+P2, Predict on P3
+    print("   [Fold 3/3] Training on 66%, Predicting remaining 34%...")
+    df_train_f2 = mega_4h[mega_4h['timestamp'].isin(np.concatenate([p1_ts, p2_ts]))]
+    df_test_f2 = mega_4h[mega_4h['timestamp'].isin(p3_ts)]
+    
+    model_f2, feats_f2 = train_mini_4h(df_train_f2)
+    if model_f2:
+        f2_preds = df_test_f2[['timestamp', 'symbol']].copy()
+        f2_preds['macro_conviction_4h'] = model_f2.predict(df_test_f2[feats_f2].fillna(0.0))
+        all_macro_preds.append(f2_preds)
+        
+    if not all_macro_preds:
+        print("   ⚠️ No macro predictions generated in any fold. Using neutral.")
+        mega_df['macro_conviction_4h'] = 0.0
+        return mega_df
+
+    full_pred_df = pd.concat(all_macro_preds, ignore_index=True)
+    
+    del mega_4h
+    gc.collect()
+    
+    return _merge_macro_preds(mega_df, full_pred_df)
+
+def train_mini_4h(df):
+    """Internal helper to train a fast, non-optimized 4h model for OOF injection."""
+    from analytics.cross_sectional import prepare_training_data
+    if len(df) < 1000: return None, []
+    try:
+        X, y, _, _, features = prepare_training_data(df, timeframe='4h')
+        if X is None or X.empty: return None, []
+        params = {'objective': 'regression', 'metric': 'rmse', 'verbosity': -1, 'learning_rate': 0.1, 'num_leaves': 31}
+        ds = lgb.Dataset(X, label=y)
+        model = lgb.train(params, ds, num_boost_round=50)
+        return model, features
+    except Exception as e:
+        print(f"   ⚠️ Mini-model training failed: {e}")
+        return None, []
+
+def _merge_macro_preds(mega_df, pred_df):
+    """Helper to merge macro predictions into the target dataframe symbol-by-symbol."""
+    print("   Merging leak-free macro predictions...")
+    pred_df = pred_df.sort_values('timestamp')
+    merged_parts = []
+    for sym, sym_df in mega_df.groupby('symbol', sort=False):
+        sym_preds = pred_df[pred_df['symbol'] == sym][['timestamp', 'macro_conviction_4h']]
+        if sym_preds.empty:
+            sym_df = sym_df.copy()
+            sym_df['macro_conviction_4h'] = 0.0
+        else:
+            sym_df = sym_df.sort_values('timestamp')
+            sym_df = pd.merge_asof(sym_df, sym_preds, on='timestamp', direction='backward')
+        merged_parts.append(sym_df)
+    
+    mega_df = pd.concat(merged_parts, ignore_index=True)
+    mega_df['macro_conviction_4h'] = mega_df['macro_conviction_4h'].fillna(0.0)
+    
+    n_filled = (mega_df['macro_conviction_4h'] != 0.0).sum()
+    print(f"   ✅ Macro conviction injected for {n_filled:,} / {len(mega_df):,} rows")
+    
+    del merged_parts, pred_df
+    gc.collect()
+    
+    mega_df = mega_df.sort_values('timestamp').reset_index(drop=True)
+    return mega_df
 
 def build_mega_dataframe(timeframe='15m'):
     """
@@ -235,6 +477,7 @@ def build_mega_dataframe(timeframe='15m'):
     for sym in symbols:
         df = fetch_and_merge_symbol_data(sym, conn, timeframe=timeframe)
         if df.empty: continue
+        df['timeframe_name'] = timeframe # Pass timeframe context for target calculation
         df = add_time_series_features(df, btc_df)
         
         # P3-4: Extreme Memory Optimization (16GB RAM Target)
@@ -260,6 +503,41 @@ def build_mega_dataframe(timeframe='15m'):
         
     mega_df = pd.concat(all_dfs, ignore_index=True)
     
+    # NEW PHASE 2: Market Regime Features
+    print("Injecting Market Regime features...")
+    if not btc_df.empty:
+        btc_df = btc_df.sort_values('timestamp')
+        btc_df['btc_ret_24'] = btc_df['btc_close'].pct_change(24)
+        btc_df['btc_volatility_24'] = btc_df['btc_close'].pct_change().rolling(24).std()
+        # Merge regime features into mega_df
+        mega_df = pd.merge_asof(mega_df.sort_values('timestamp'), btc_df[['timestamp', 'btc_ret_24', 'btc_volatility_24']], on='timestamp', direction='backward')
+    else:
+        mega_df['btc_ret_24'] = 0.0
+        mega_df['btc_volatility_24'] = 0.0
+        
+    # Market Breadth: % of assets with positive 12-bar returns at this timestamp
+    if 'ret_12' in mega_df.columns:
+        mega_df['market_breadth'] = mega_df.groupby('timestamp')['ret_12'].transform(lambda x: (x > 0).mean())
+    else:
+        mega_df['market_breadth'] = 0.5
+    
+    # PHASE 4: Regime Score — trend strength indicator
+    mega_df['regime_score'] = abs(mega_df['btc_ret_24']) / (mega_df['btc_volatility_24'] + 1e-9)
+    
+    # PHASE 3 FIX: Outlier Winsorization
+    # Clip extreme 1%/99% outliers for critical columns to protect the linear model
+    # Optimized for speed (uses Cython-backed quantile transform)
+    print("Applying Outlier Winsorization (1%/99%)...")
+    critical_cols = ['fwd_return', 'funding_rate', 'volume_zscore', 'volatility_zscore']
+    for col in critical_cols:
+        if col in mega_df.columns:
+            q_01 = mega_df.groupby('timestamp')[col].transform('quantile', 0.01)
+            q_99 = mega_df.groupby('timestamp')[col].transform('quantile', 0.99)
+            mega_df[col] = mega_df[col].clip(lower=q_01, upper=q_99)
+
+    # PHASE 4: Macro Conviction Injection (4h → 15m/1h)
+    mega_df = inject_macro_conviction(mega_df, timeframe)
+
     # P3-5: Explicit Garbage Collection
     print(f"Mega-DataFrame constructed: {len(mega_df)} rows. Purging intermediate memory...")
     del all_dfs
@@ -269,51 +547,52 @@ def build_mega_dataframe(timeframe='15m'):
     print("Applying cross-sectional ranking...")
     
     # Columns to rank
-    continuous_features = [
-        'rsi', 'macd', 'volatility_20', 'basis_pct', 'oi_usd', 'funding_rate', 
-        'sum_toptrader_long_short_ratio', 'corr_to_index',
-        'oi_delta_4', 'funding_delta_4', 'taker_buy_sell_ratio', 
-        'distance_from_ema_50', 'volatility_zscore', 'volume_zscore', 'relative_strength_btc',
-        'cvd_slope_5', 'price_cvd_divergence', 'sentiment_divergence',
-        'trend_convergence', 'bbw_squeeze', 'funding_basis_divergence'
-    ]
+    continuous_features = RAW_CONTINUOUS
     
     for col in continuous_features:
         if col in mega_df.columns:
             mega_df[f'rank_{col}'] = mega_df.groupby('timestamp')[col].rank(pct=True)
         
-    # Rank Target
-    mega_df['target_rank'] = mega_df.groupby('timestamp')['fwd_return'].rank(pct=True)
+    # PHASE 3.5: Magnitude-Aware Hybrid Target (Optimized Vectorized version)
+    print("Calculating Magnitude-Aware Hybrid Target (50/50 Raw/Risk-Adj)...")
+    g = mega_df.groupby('timestamp')
+    z_raw = (mega_df['fwd_return'] - g['fwd_return'].transform('mean')) / (g['fwd_return'].transform('std') + 1e-9)
+    z_risk = (mega_df['risk_adj_ret'] - g['risk_adj_ret'].transform('mean')) / (g['risk_adj_ret'].transform('std') + 1e-9)
+    mega_df['target_magnitude'] = 0.5 * z_raw + 0.5 * z_risk
+    
+    # We also keep target_rank for the Spearman evaluation in the orchestrator
+    mega_df['target_rank'] = g['target_magnitude'].rank(pct=True)
     
     # Drop rows where target or critical features are NaN
-    mega_df = mega_df.dropna(subset=['target_rank', 'rank_rsi', 'rank_oi_delta_4'])
+    mega_df = mega_df.dropna(subset=['target_magnitude', 'rank_rsi', 'rank_oi_delta_4'])
     
     return mega_df
 
-def prepare_training_data(mega_df):
+def prepare_training_data(mega_df, timeframe='15m'):
     """
     Phase 3: Chronological Walk-Forward Split, LightGBM Training, and S3 Export.
+    Selects feature sets based on timeframe (Asymmetric Pruning).
     """
-    print("Preparing for LightGBM Training...")
+    print(f"Preparing training data for {timeframe}...")
     
     # Sort chronologically for Walk-Forward split
     mega_df = mega_df.sort_values('timestamp')
     
-    # Define features
-    continuous_features = [
-        'rank_rsi', 'rank_macd', 'rank_volatility_20', 'rank_basis_pct', 'rank_oi_usd', 
-        'rank_funding_rate', 'rank_sum_toptrader_long_short_ratio', 'rank_corr_to_index',
-        'rank_oi_delta_4', 'rank_funding_delta_4', 'rank_taker_buy_sell_ratio',
-        'rank_distance_from_ema_50', 'rank_volatility_zscore', 'rank_volume_zscore', 'rank_relative_strength_btc',
-        'rank_cvd_slope_5', 'rank_price_cvd_divergence', 'rank_sentiment_divergence',
-        'rank_trend_convergence', 'rank_bbw_squeeze', 'rank_funding_basis_divergence'
-    ]
-    time_features = ['hour_sin', 'hour_cos', 'day_sin', 'day_cos']
+    continuous, time_features = get_feature_names(timeframe)
+    features = continuous + time_features
     
-    features = continuous_features + time_features
+    if timeframe == '4h':
+        print(f"✂️ Using PRUNED feature set for 4h ({len(features)} features)")
+    else:
+        print(f"🔥 Using FULL feature set for {timeframe} ({len(features)} features)")
     
-    X = mega_df[features]
-    y = mega_df['target_rank']
+    X = mega_df[features].copy()
+    y = mega_df['target_magnitude']
+    
+    # PHASE 3 FIX: Fill NaNs for Linear Model (Ridge)
+    # Tree models handle NaN, but Ridge requires finite values.
+    # Since most features are ranks [0, 1], 0.5 is a safe neutral value.
+    X = X.fillna(0.5)
     
     # Walk-Forward Split (85% Train, 15% Validation)
     split_idx = int(len(mega_df) * 0.85)
@@ -323,11 +602,11 @@ def prepare_training_data(mega_df):
     
     return X_train, y_train, X_val, y_val, features
 
-def optimize_lgbm_hyperparameters(X_train, y_train, X_val, y_val, n_trials=50):
+def optimize_lgbm_hyperparameters(X_train, y_train, X_val, y_val, n_trials=50, timeframe='15m'):
     """
     Uses Optuna to find the best hyperparameters for LightGBM.
     """
-    print(f"🚀 Starting Optuna HPO with {n_trials} trials...")
+    print(f"🚀 Starting Optuna HPO with {n_trials} trials for {timeframe}...")
     
     def objective(trial):
         params = {
@@ -364,16 +643,17 @@ def optimize_lgbm_hyperparameters(X_train, y_train, X_val, y_val, n_trials=50):
     
     # Persistent Save
     os.makedirs(MODEL_DIR, exist_ok=True)
-    with open(PARAMS_PATH, 'w') as f:
+    params_path = get_params_path(timeframe)
+    with open(params_path, 'w') as f:
         json.dump(study.best_params, f, indent=4)
         
     return study.best_params
 
-def train_ensemble_models(mega_df, optimized_params=None):
+def train_ensemble_models(mega_df, optimized_params=None, timeframe='15m'):
     """
-    Phase 4: Train an ensemble of LightGBM + XGBoost for maximum robustness.
+    Train an ensemble of LightGBM + XGBoost + Ridge for maximum robustness.
     """
-    X_train, y_train, X_val, y_val, features = prepare_training_data(mega_df)
+    X_train, y_train, X_val, y_val, features = prepare_training_data(mega_df, timeframe=timeframe)
     
     # 1. Train LightGBM
     print("🧠 Training LightGBM...")
@@ -381,9 +661,10 @@ def train_ensemble_models(mega_df, optimized_params=None):
     val_data_lgb = lgb.Dataset(X_val, label=y_val, reference=train_data_lgb)
     
     # Load persisted params if none provided
-    if optimized_params is None and os.path.exists(PARAMS_PATH):
-        print(f"📂 Loading persisted HPO parameters from {PARAMS_PATH}")
-        with open(PARAMS_PATH, 'r') as f:
+    params_path = get_params_path(timeframe)
+    if optimized_params is None and os.path.exists(params_path):
+        print(f"📂 Loading persisted HPO parameters from {params_path}")
+        with open(params_path, 'r') as f:
             optimized_params = json.load(f)
 
     lgb_params = {
@@ -394,7 +675,7 @@ def train_ensemble_models(mega_df, optimized_params=None):
         **(optimized_params if optimized_params else {'learning_rate': 0.05, 'num_leaves': 31})
     }
     
-    lgb_model = lgb.train(
+    model_lgb = lgb.train(
         lgb_params,
         train_data_lgb,
         num_boost_round=1000,
@@ -404,66 +685,91 @@ def train_ensemble_models(mega_df, optimized_params=None):
     
     # 2. Train XGBoost
     print("🧠 Training XGBoost...")
-    xgb_model = xgb.XGBRegressor(
-        n_estimators=1000,
-        learning_rate=0.05,
-        max_depth=6,
-        subsample=0.8,
-        colsample_bytree=0.8,
-        early_stopping_rounds=50,
-        verbosity=0
+    model_xgb = xgb.XGBRegressor(
+        n_estimators=200, 
+        max_depth=6, 
+        learning_rate=0.05, 
+        n_jobs=-1,
+        early_stopping_rounds=20
     )
-    xgb_model.fit(X_train, y_train, eval_set=[(X_val, y_val)], verbose=False)
+    model_xgb.fit(X_train, y_train, eval_set=[(X_val, y_val)], verbose=False)
     
-    # 3. Evaluate Ensemble (Averaging Ranks)
-    lgb_preds = lgb_model.predict(X_val)
-    xgb_preds = xgb_model.predict(X_val)
-    ensemble_preds = (lgb_preds + xgb_preds) / 2.0
+    # 3. Train Ridge Regression (Phase 3: Linear Ensemble)
+    print("🧠 Training Ridge Regression (Linear Perspective)...")
+    model_ridge = Ridge(alpha=1.0)
+    model_ridge.fit(X_train, y_train)
+    
+    # 4. Evaluate Ensemble (Weighted Average)
+    lgb_preds = model_lgb.predict(X_val)
+    xgb_preds = model_xgb.predict(X_val)
+    ridge_preds = model_ridge.predict(X_val)
+    
+    # Weighted Ensemble: 40% Trees, 20% Linear
+    ensemble_preds = (0.4 * lgb_preds) + (0.4 * xgb_preds) + (0.2 * ridge_preds)
     
     spearman_corr, p_value = spearmanr(ensemble_preds, y_val)
-    print(f"Validation Ensemble Spearman Correlation: {spearman_corr:.4f}")
+    rmse = np.sqrt(np.mean((ensemble_preds - y_val)**2))
+    print(f"✅ Validation Ensemble Spearman Correlation: {spearman_corr:.4f}")
     
-    # Save Models Locally
+    return (model_lgb, model_xgb, model_ridge), features, spearman_corr, p_value, rmse
+
+def train_cross_sectional_lgbm(mega_df, optimized_params=None, timeframe='15m'):
+    """Main entry point for training and persisting the ensemble."""
     timestamp_str = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d_%H%M%S")
-    model_dir = os.path.join(os.path.dirname(__file__), 'models')
-    os.makedirs(model_dir, exist_ok=True)
+    os.makedirs(MODEL_DIR, exist_ok=True)
     
-    lgb_path = os.path.join(model_dir, 'cross_sectional_lgbm.txt')
-    xgb_path = os.path.join(model_dir, 'cross_sectional_xgboost.json')
-    meta_path = os.path.join(model_dir, 'cross_sectional_lgbm_meta.json') # Kept as lgbm_meta for legacy compatibility
+    lgb_path = os.path.join(MODEL_DIR, f'cross_sectional_lgbm_{timeframe}.txt')
+    xgb_path = os.path.join(MODEL_DIR, f'cross_sectional_xgboost_{timeframe}.json')
+    ridge_path = os.path.join(MODEL_DIR, f'cross_sectional_ridge_{timeframe}.joblib')
+    meta_path = os.path.join(MODEL_DIR, f'cross_sectional_lgbm_{timeframe}_meta.json')
     
-    lgb_model.save_model(lgb_path)
-    xgb_model.save_model(xgb_path)
+    ensemble, features, spearman_corr, p_value, rmse = train_ensemble_models(mega_df, optimized_params, timeframe=timeframe)
+    model_lgb, model_xgb, model_ridge = ensemble
     
-    # Save versioned
-    lgb_model.save_model(os.path.join(model_dir, f'lgbm_{timestamp_str}.txt'))
-    xgb_model.save_model(os.path.join(model_dir, f'xgboost_{timestamp_str}.json'))
+    # Feature Importance (LGBM + XGB)
+    lgb_importance = dict(zip(features, model_lgb.feature_importance(importance_type='gain').tolist()))
+    xgb_importance = dict(zip(features, [float(v) for v in model_xgb.feature_importances_]))
     
+    total_lgb = sum(lgb_importance.values()) + 1e-9
+    total_xgb = sum(xgb_importance.values()) + 1e-9
+    
+    combined_importance = []
+    for f in features:
+        combined_importance.append({
+            'feature': f,
+            'combined_importance': ((lgb_importance[f] / total_lgb) + (xgb_importance[f] / total_xgb)) / 2.0
+        })
+    combined_importance.sort(key=lambda x: x['combined_importance'], reverse=True)
+    
+    # Save Metadata
     with open(meta_path, 'w') as f:
         json.dump({
-            'validation_spearman_correlation': float(spearman_corr),
-            'spearman_p_value': float(p_value),
             'timestamp': timestamp_str,
-            'is_ensemble': True
+            'is_ensemble': True,
+            'validation_spearman': float(spearman_corr),
+            'validation_rmse': float(rmse),
+            'spearman_p_value': float(p_value),
+            'feature_importance': combined_importance
         }, f, indent=4)
     
-    # S3 Export
+    # Save Models
+    model_lgb.save_model(lgb_path)
+    model_xgb.save_model(xgb_path)
+    joblib.dump(model_ridge, ridge_path)
+    
+    # Upload to S3
     if boto3:
+        s3 = boto3.client('s3')
         try:
-            s3_client = boto3.client('s3')
-            s3_client.upload_file(lgb_path, AWS_BUCKET, 'models/cross_sectional_lgbm.txt')
-            s3_client.upload_file(xgb_path, AWS_BUCKET, 'models/cross_sectional_xgboost.json')
-            s3_client.upload_file(meta_path, AWS_BUCKET, 'models/cross_sectional_lgbm_meta.json')
-            print(f"✅ Ensemble Models and Metadata uploaded to S3 bucket '{AWS_BUCKET}'.")
+            s3.upload_file(lgb_path, AWS_BUCKET, f'models/cross_sectional_lgbm_{timeframe}.txt')
+            s3.upload_file(xgb_path, AWS_BUCKET, f'models/cross_sectional_xgboost_{timeframe}.json')
+            s3.upload_file(ridge_path, AWS_BUCKET, f'models/cross_sectional_ridge_{timeframe}.joblib')
+            s3.upload_file(meta_path, AWS_BUCKET, f'models/cross_sectional_lgbm_{timeframe}_meta.json')
+            print(f"✅ Ensemble Models (LGBM+XGB+Ridge) uploaded to S3 bucket '{AWS_BUCKET}'.")
         except Exception as e:
             print(f"⚠️ S3 upload failed: {e}")
             
-    return (lgb_model, xgb_model), features
-
-def train_cross_sectional_lgbm(mega_df, optimized_params=None):
-    """Legacy wrapper for weekly cycle compatibility."""
-    ensemble, features = train_ensemble_models(mega_df, optimized_params)
-    return ensemble[0], features # Return LightGBM for Step 3/4 which currently only support one model
+    return model_lgb, features # Legacy return for some callers
 
 if __name__ == "__main__":
     mega_df = build_mega_dataframe()

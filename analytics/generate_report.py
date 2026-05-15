@@ -7,39 +7,16 @@ Produces a comprehensive Markdown report from:
   - Top 10 / Bottom 10 asset rankings with per-asset feature attribution
   - AI Executive Verdict from OpenRouter LLM
 
-This replaces the legacy grid-search-based report. No more elite_squad.json
-or all_grid_results.json — the report is driven entirely by the LightGBM
-cross-sectional ranking model.
+Now supports multiple timeframes in a single report.
 """
 import os
 from datetime import datetime
-
 from analytics.llm_analyzer import get_llm_verdict, build_llm_context
 
 REPORT_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'reports')
 
-
-def generate_report(cycle_results: dict) -> str:
-    """
-    Generate the Weekly Intelligence Report from the orchestrator's output.
-
-    Parameters
-    ----------
-    cycle_results : dict
-        Output from weekly_orchestrator.run_weekly_cycle(), containing:
-        - simulation_results
-        - feature_importance
-        - per_asset_drivers
-        - model_meta
-        - top_n, bottom_n
-
-    Returns
-    -------
-    str
-        Path to the generated report file.
-    """
-    os.makedirs(REPORT_DIR, exist_ok=True)
-
+def build_report_section(timeframe: str, cycle_results: dict) -> str:
+    """Builds a single timeframe's section of the report."""
     sim = cycle_results.get('simulation_results')
     feat_imp = cycle_results.get('feature_importance', {})
     drivers = cycle_results.get('per_asset_drivers', {})
@@ -47,20 +24,12 @@ def generate_report(cycle_results: dict) -> str:
     top_n = cycle_results.get('top_n', 10)
     bottom_n = cycle_results.get('bottom_n', 10)
 
-    now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
-    timestamp_file = datetime.now().strftime("%Y%m%d_%H%M")
+    md = f"## ⏱️ Timeframe: {timeframe}\n\n"
 
-    # ─── Build Report ───
-    md = f"""# Weekly Market Intelligence Report
-*Generated: {now_str} UTC*
-*Model: LightGBM Cross-Sectional Ranking Engine*
-
-"""
-
-    # ─── Section 1: Model Health ───
-    md += "## 📊 Model Training Summary\n\n"
+    # --- Section 1: Model Health ---
+    md += "### 📊 Model Training Summary\n"
     rmse = model_meta.get('validation_rmse', 'N/A')
-    spearman = model_meta.get('validation_spearman_correlation', 'N/A')
+    spearman = model_meta.get('validation_spearman', 'N/A')
     p_val = model_meta.get('spearman_p_value', 'N/A')
 
     def fmt(v):
@@ -77,9 +46,9 @@ def generate_report(cycle_results: dict) -> str:
     else:
         md += f"> Model Health: Unknown | RMSE = {rmse} | Spearman = {spearman}\n\n"
 
-    # ─── Section 2: OOS Simulation Results ───
-    md += "## 🔬 Out-of-Sample Dry Run\n"
-    md += "*These results use LAST week's model on THIS week's data — no lookahead bias.*\n\n"
+    # --- Section 2: OOS Simulation Results ---
+    md += "### 🔬 Out-of-Sample Dry Run\n"
+    md += "*Results use LAST week's model on THIS week's data.*\n\n"
 
     if sim and sim.get('n_rebalances', 0) > 0:
         md += "| Metric | Value |\n"
@@ -91,32 +60,21 @@ def generate_report(cycle_results: dict) -> str:
         md += f"| **Max Drawdown** | {sim['max_drawdown']:.2%} |\n"
         md += f"| **Rebalances** | {sim['n_rebalances']} |\n"
         md += f"| **Avg Daily Return** | {sim['avg_daily_return']:+.4%} |\n\n"
+
+        if 'mc_stats' in sim:
+            mc = sim['mc_stats']
+            md += "#### 🛡️ Robustness Analysis (Monte Carlo)\n"
+            md += f"- **Probability of Profit**: {mc['prob_profit']:.1%}\n"
+            md += f"- **95% CI**: [{mc['ci_lower']:+.2%}, {mc['ci_upper']:+.2%}]\n\n"
     else:
         md += "> ⚠️ No OOS simulation available. This is the first training run.\n\n"
 
-    # ─── Section 2.5: Robustness (Monte Carlo) ───
-    if sim and 'mc_stats' in sim:
-        mc = sim['mc_stats']
-        md += "### 🛡️ Robustness Analysis (Monte Carlo)\n"
-        md += f"*Bootstrapped over {mc['sims']} randomized return sequences.*\n\n"
-        md += f"- **Probability of Profit**: {mc['prob_profit']:.1%}\n"
-        md += f"- **95% CI Lower Bound**: {mc['ci_lower']:+.2%}\n"
-        md += f"- **95% CI Upper Bound**: {mc['ci_upper']:+.2%}\n"
-        
-        if mc['prob_profit'] > 0.90:
-            verdict = "✅ **High Confidence**: Model edge is likely structural."
-        elif mc['prob_profit'] > 0.70:
-            verdict = "⚠️ **Moderate Confidence**: Model edge shows some sequence sensitivity."
-        else:
-            verdict = "🚨 **Low Confidence**: Model edge may be a chronological fluke."
-        md += f"\n> **Robustness Verdict**: {verdict}\n\n"
-
-    # ─── Section 3: Top 10 Longs ───
+    # --- Section 3: Top Assets ---
     top_symbols = drivers.get('top_symbols', [])
     top_drv = drivers.get('top_drivers', {})
 
-    md += f"## 🟢 Top {top_n} Longs (Highest Predicted Rank)\n\n"
-    md += "| Rank | Symbol | Predicted Score | Key Drivers |\n"
+    md += f"#### 🟢 Top {len(top_symbols)} Longs\n"
+    md += "| Rank | Symbol | Score | Key Drivers |\n"
     md += "| :--- | :--- | :--- | :--- |\n"
 
     for i, entry in enumerate(top_symbols):
@@ -126,12 +84,12 @@ def generate_report(cycle_results: dict) -> str:
         driver_str = ", ".join([f"`{k}`" for k in list(d.keys())[:3]]) if d else "—"
         md += f"| {i+1} | **{sym}** | {rank:.4f} | {driver_str} |\n"
 
-    # ─── Section 4: Bottom 10 Shorts ───
+    # --- Section 4: Bottom Assets ---
     bottom_symbols = drivers.get('bottom_symbols', [])
     bottom_drv = drivers.get('bottom_drivers', {})
 
-    md += f"\n## 🔴 Bottom {bottom_n} Shorts (Lowest Predicted Rank)\n\n"
-    md += "| Rank | Symbol | Predicted Score | Key Drivers |\n"
+    md += f"\n#### 🔴 Bottom {len(bottom_symbols)} Shorts\n"
+    md += "| Rank | Symbol | Score | Key Drivers |\n"
     md += "| :--- | :--- | :--- | :--- |\n"
 
     for i, entry in enumerate(bottom_symbols):
@@ -141,47 +99,84 @@ def generate_report(cycle_results: dict) -> str:
         driver_str = ", ".join([f"`{k}`" for k in list(d.keys())[:3]]) if d else "—"
         md += f"| {i+1} | **{sym}** | {rank:.4f} | {driver_str} |\n"
 
-    # ─── Section 5: Feature Importance ───
-    md += "\n## 🧠 Model Feature Importance (Top 10 by Gain)\n\n"
-    md += "| Feature | Importance (%) |\n"
-    md += "| :--- | :--- |\n"
+    md += "\n---\n\n"
+    return md
 
-    for feat, imp in list(feat_imp.items())[:10]:
-        bar = "█" * int(imp / 2)
-        md += f"| `{feat}` | {imp:.1f}% {bar} |\n"
+def generate_report(multi_results: dict) -> str:
+    """
+    Generate the Weekly Intelligence Report for multiple timeframes.
 
-    # ─── Section 6: AI Executive Verdict ───
-    md += "\n## 🤖 AI Executive Verdict\n\n"
+    Parameters
+    ----------
+    multi_results : dict
+        Dict mapping timeframe strings ('15m', '1h', etc.) to results dictionaries.
+    """
+    os.makedirs(REPORT_DIR, exist_ok=True)
 
-    llm_context = build_llm_context(sim, feat_imp, drivers, model_meta)
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+    timestamp_file = datetime.now().strftime("%Y%m%d_%H%M")
+
+    md = f"# Weekly Multi-Timeframe Intelligence Report\n"
+    md += f"*Generated: {now_str} UTC*\n\n"
+
+    # --- Table of Contents ---
+    md += "## 📌 Summary of Metrics\n\n"
+    md += "| Timeframe | Return | Sharpe | Win Rate | Spearman ρ |\n"
+    md += "| :--- | :--- | :--- | :--- | :--- |\n"
+    
+    for tf, res in multi_results.items():
+        sim = res.get('simulation_results')
+        meta = res.get('model_meta', {})
+        ret = f"{sim['total_return']:+.2%}" if sim else "N/A"
+        sha = f"{sim['sharpe']:.2f}" if sim else "N/A"
+        win = f"{sim['win_rate']:.1%}" if sim else "N/A"
+        rho = f"{meta.get('validation_spearman', 0):.4f}"
+        md += f"| **{tf}** | {ret} | {sha} | {win} | {rho} |\n"
+    
+    md += "\n"
+
+    # --- Timeframe Sections ---
+    for tf, res in multi_results.items():
+        md += build_report_section(tf, res)
+
+    # --- Section 6: AI Executive Verdict (Using the strongest timeframe as context) ---
+    md += "## 🤖 AI Executive Verdict\n\n"
+    
+    # Heuristic: use the timeframe with the highest Spearman for the LLM context
+    best_tf = max(multi_results.keys(), key=lambda k: multi_results[k].get('model_meta', {}).get('validation_spearman', 0))
+    best_res = multi_results[best_tf]
+    
+    llm_context = build_llm_context(
+        best_res.get('simulation_results'),
+        best_res.get('feature_importance', {}),
+        best_res.get('per_asset_drivers', {}),
+        best_res.get('model_meta', {})
+    )
+    # Add a note about multiple timeframes to the context
+    llm_context += f"\nNote: This verdict is primarily based on the {best_tf} timeframe, which showed the highest predictive accuracy."
+    
     verdict = get_llm_verdict(llm_context)
     md += f"{verdict}\n"
 
-    # ─── Footer ───
+    # --- Footer ---
     md += """
 ---
-> **Note**: This report is generated from the Alpha Factory's LightGBM Cross-Sectional
-> Ranking Engine. OOS metrics use the previous week's model on current data.
-> The Top/Bottom rankings reflect the NEW model's predictions for the upcoming week.
+> **Note**: This report integrates results from multiple LightGBM Cross-Sectional models.
+> OOS metrics use last week's model for each timeframe. 
+> Rankings reflect predictions for the upcoming week.
 """
 
-    # ─── Save ───
-    # Save as latest
-    latest_path = os.path.join(REPORT_DIR, "latest_market_report.md")
+    # --- Save ---
+    latest_path = os.path.join(REPORT_DIR, "latest_multi_tf_report.md")
     with open(latest_path, "w", encoding="utf-8") as f:
         f.write(md)
 
-    # Save timestamped archive
-    archive_path = os.path.join(REPORT_DIR, f"report_{timestamp_file}.md")
+    archive_path = os.path.join(REPORT_DIR, f"multi_tf_report_{timestamp_file}.md")
     with open(archive_path, "w", encoding="utf-8") as f:
         f.write(md)
 
-    print(f"📄 Report saved to {latest_path}")
-    print(f"📄 Archive saved to {archive_path}")
-
+    print(f"📄 Aggregated report saved to {latest_path}")
     return latest_path
 
-
 if __name__ == "__main__":
-    # Standalone test — requires a full cycle to have run first
     print("⚠️ Use 'python master.py report' to generate a report with full cycle data.")

@@ -13,6 +13,10 @@ ENV/
 *.db-wal
 *.sqlite3
 
+# Models
+analytics/models/*
+!analytics/models/best_params_*.json
+
 # Environment & Secrets
 .env
 .env.*
@@ -24,11 +28,9 @@ data/
 downloads/
 *.zip
 *.csv
-*.json
 *.txt
 *.pkl
 !requirements.txt
-!analytics/models/best_params.json
 
 # Reports
 reports/

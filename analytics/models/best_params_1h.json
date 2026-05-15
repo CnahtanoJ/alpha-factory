@@ -1,0 +1,9 @@
+{
+    "learning_rate": 0.04764166037129138,
+    "num_leaves": 51,
+    "max_depth": 5,
+    "feature_fraction": 0.6527080042601799,
+    "bagging_fraction": 0.6351735046753022,
+    "bagging_freq": 1,
+    "min_child_samples": 15
+}

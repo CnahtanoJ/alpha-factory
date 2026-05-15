@@ -10,16 +10,16 @@ Alpha Factory operates in two distinct phases to maximize research depth and exe
 
 ### Phase 1: Local Research Hub (Weekly)
 *   **Data Ingestion**: Pulls years of high-fidelity data from **Binance Vision** archives and fills the "live edge" via Binance API.
-*   **AI Training**: Trains an **XGBoost + Random Forest Ensemble** to identify market regimes and movement conviction.
-*   **The Strategist (Grid Search)**: Performs an exhaustive backtest across **200+ symbols** and **12 strategy families**.
+*   **Hierarchical AI Training**: Trains a **Stacked Ensemble (LGBM + XGB + Ridge)** using **3-Fold Walk-Forward OOF Injection** to anchor short-term signals in macro trends.
+*   **Cross-Sectional Ranking**: Instead of simple backtesting, the system ranks the entire market using **Magnitude-Aware Target Regression**.
 *   **Outputs**: 
     *   `elite_squad.json`: Top 20 strategies with a Hyperliquid-tradability guarantee.
     *   `all_grid_results.json`: Full market distribution data.
     *   `weekly_intelligence_report.md`: High-level strategic breakdown for human review.
 
 ### Phase 2: Cloud Execution (Hourly)
-*   **The Scout**: Re-scores the Elite Squad using live market data and AI conviction.
-*   **Fusion Logic**: Combines historical math (Sharpe/PF) with live AI probabilities to find the absolute best trade at that moment.
+*   **Macro-Shielded Inference**: Re-scores the market using the trained ensemble and a **4h Macro Conviction** filter.
+*   **Dynamic Portfolio**: Manages a concentrated portfolio (Top 5 Longs, Bottom 5 Shorts) with **ATR-based risk scaling** and **Hysteresis-Based Rebalancing**.
 *   **The Executor**: An autonomous **HyperliquidBot** (AWS Lambda) that manages positions, risk, and order flow.
 
 ---

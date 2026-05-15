@@ -7,6 +7,8 @@ import pandas as pd
 import numpy as np
 import lightgbm as lgb
 import xgboost as xgb
+from sklearn.linear_model import Ridge
+import joblib
 from eth_account import Account
 from hyperliquid.info import Info
 from hyperliquid.exchange import Exchange
@@ -86,20 +88,19 @@ class LiveInferenceEngine:
         df['funding_rate'] = float(ctx.get('funding', 0))
 
         # --- LIVE SENTIMENT INJECTION ---
+        # Map Binance dict keys to canonical model feature names
         top_trader = np.nan
         global_retail = np.nan
         
         if self.live_sentiment and symbol in self.live_sentiment:
-            top_trader = self.live_sentiment[symbol].get('top_long_short')
-            global_retail = self.live_sentiment[symbol].get('global_long_short')
+            # Sync with Binance API dict keys
+            top_trader = self.live_sentiment[symbol].get('top_trader_ratio')
+            global_retail = self.live_sentiment[symbol].get('long_short_ratio')
             
         df['sum_toptrader_long_short_ratio'] = top_trader
         df['sum_long_short_ratio'] = global_retail
         
-        # Fallback logic to match training exactly
-        if pd.isna(global_retail):
-            global_retail = top_trader
-            
+        # Fallback to neutral cross-sectional mean (later in the pipeline)
         if pd.notna(top_trader) and pd.notna(global_retail):
             df['sentiment_divergence'] = top_trader - global_retail
         else:
@@ -125,10 +126,11 @@ class LiveInferenceEngine:
         # 1. Derivatives Velocity
         df['oi_delta_4'] = df['oi_usd'].pct_change(4)
         df['funding_delta_4'] = df['funding_rate'].diff(4)
+        df['sum_toptrader_ls_delta_4'] = df['sum_toptrader_long_short_ratio'].diff(4)
         
-        # Live context doesn't easily provide taker buy/sell ratio per symbol without extra API calls,
-        # and we know it's a weak feature in live context, so we pad it.
-        df['taker_buy_sell_ratio'] = np.nan
+        # Net Taker Volume Z-score Proxy (from CVD delta)
+        vol_ma_20 = df['volume'].rolling(20).mean()
+        df['net_taker_volume_zscore'] = (df['cvd_slope_5'] / (vol_ma_20 + 1e-9)).fillna(0.0)
         
         # 2. Momentum & Mean Reversion Refinements
         ema_50 = df['close'].ewm(span=50, adjust=False).mean()
@@ -142,15 +144,23 @@ class LiveInferenceEngine:
         vol_sd = df['volume'].rolling(50).std()
         df['volume_zscore'] = (df['volume'] - vol_ma) / (vol_sd + 1e-9)
         
-        # 3. Relative Strength (vs BTC)
+        # 3. Relative Strength (vs BTC) & Market Beta
         if index_df is not None and not index_df.empty:
             df['ret_12'] = df['close'].pct_change(12)
             
             # Use 'hist_index_close' which was mapped from index_df in earlier step
             df['btc_ret_12'] = df['hist_index_close'].pct_change(12)
             df['relative_strength_btc'] = df['ret_12'] - df['btc_ret_12']
+            
+            # Phase 5: Market Beta
+            asset_ret_1 = df['close'].pct_change()
+            idx_ret_1 = df['hist_index_close'].pct_change()
+            cov = asset_ret_1.rolling(20).cov(idx_ret_1)
+            var = idx_ret_1.rolling(20).var()
+            df['market_beta'] = (cov / (var + 1e-9)).fillna(0.0)
         else:
             df['relative_strength_btc'] = 0.0
+            df['market_beta'] = 0.0
             
         # 4. Proxy CVD & Divergence
         candle_range = df['high'] - df['low']
@@ -199,27 +209,78 @@ class LiveInferenceEngine:
         
         basis_100_mean = df['basis_pct'].rolling(100).mean()
         basis_100_std = df['basis_pct'].rolling(100).std()
+        
+        # Phase 5: Additional Missing Features for Parity
+        # VPT Slope (Volume Price Trend)
+        vpt = (df['volume'] * df['close'].pct_change()).cumsum()
+        df['vpt_slope'] = vpt.diff(5) / (df['volume'].rolling(20).mean() + 1e-9)
+        
+        # Range Expansion
+        atr = df['volatility_20'] # Use 20-period std as proxy for volatility if ATR isn't ready
+        df['range_expansion'] = (df['high'] - df['low']) / (atr + 1e-9)
+        
+        # RSI Divergence Proxy
+        rsi_delta_5 = df['rsi'].diff(5)
+        price_delta_5 = df['close'].pct_change(5)
+        df['rsi_divergence'] = rsi_delta_5 - price_delta_5
         basis_z = (df['basis_pct'] - basis_100_mean) / (basis_100_std + 1e-9)
         
         df['funding_basis_divergence'] = (fund_z - basis_z).fillna(0.0)
-                
-        return df.iloc[-1:] # Return only the latest row
+        
+        # 6. Phase 5 Features
+        # Volume to Volatility Ratio
+        df['vol_volatility_ratio'] = df['volume'] / (df['volatility_20'] + 1e-9)
+        
+        # RSI Timeframe Divergence
+        rsi_7 = RSIIndicator(close=df['close'], window=7).rsi()
+        rsi_21 = RSIIndicator(close=df['close'], window=21).rsi()
+        df['rsi_divergence'] = rsi_7 - rsi_21
+        
+        # Volume Price Trend (VPT) Slope
+        prev_close = df['close'].shift(1)
+        vpt = df['volume'] * ((df['close'] - prev_close) / (prev_close + 1e-9))
+        df['vpt_slope'] = vpt.cumsum().diff(5)
+        
+        # Intraday Range Expansion
+        tr_live = pd.concat([
+            df['high'] - df['low'],
+            (df['high'] - df['close'].shift(1)).abs(),
+            (df['low'] - df['close'].shift(1)).abs()
+        ], axis=1).max(axis=1)
+        atr_14_live = tr_live.rolling(14).mean()
+        df['range_expansion'] = (df['high'] - df['low']) / (atr_14_live + 1e-9)
+        
+        # --- NEW PHASE 2 DELTA FEATURES ---
+        df['rsi_delta_4'] = df['rsi'].diff(4)
+        df['macd_delta_4'] = df['macd'].diff(4)
+        df['volatility_delta_4'] = df['volatility_20'].diff(4)
+        df['volume_delta_4'] = df['volume'].pct_change(4)
+        df['oi_change_pct_12'] = df['oi_usd'].pct_change(12)
+        df['funding_acceleration'] = df['funding_delta_4'].diff(1)
+        
+        # Return only the latest row, but keep features needed for ranking and regime
+        return df.iloc[-1:] 
 
 # ==========================================
-if TESTNET_MODE:
-    KEY = os.environ.get("TESTNET_PRIVATE_KEY")
-    ADDR = os.environ.get("TESTNET_ACCOUNT_ADDRESS")
-else:
-    KEY = os.environ.get("MAINNET_PRIVATE_KEY")
-    ADDR = os.environ.get("MAINNET_ACCOUNT_ADDRESS")
-
-if not KEY or not ADDR:
-    raise ValueError(f"❌ MISSING CREDENTIALS! Mode is {TESTNET_MODE}, but keys not found in Env Vars.")
+# Credentials will be loaded dynamically inside executor_handler based on timeframe
 
 def executor_handler(event, context):
     logger.info(f"🚀 Waking up Live Engine...")
     info = Info(BASE_URL, skip_ws=True)
     
+    timeframe = event.get("timeframe", "15m")
+    env_suffix = timeframe.upper()
+    
+    # 0. 🔑 DYNAMIC CREDENTIAL LOADING (Sub-Account Architecture)
+    if TESTNET_MODE:
+        KEY = os.environ.get(f"TESTNET_PRIVATE_KEY_{env_suffix}", os.environ.get("TESTNET_PRIVATE_KEY"))
+        ADDR = os.environ.get(f"TESTNET_ACCOUNT_ADDRESS_{env_suffix}", os.environ.get("TESTNET_ACCOUNT_ADDRESS"))
+    else:
+        KEY = os.environ.get(f"MAINNET_PRIVATE_KEY_{env_suffix}", os.environ.get("MAINNET_PRIVATE_KEY"))
+        ADDR = os.environ.get(f"MAINNET_ACCOUNT_ADDRESS_{env_suffix}", os.environ.get("MAINNET_ACCOUNT_ADDRESS"))
+
+    if not KEY or not ADDR:
+        raise ValueError(f"❌ MISSING CREDENTIALS! Could not find API keys for timeframe '{timeframe}'. Checked suffix '_{env_suffix}' and default.")
     task = event.get("task", "execute_trades")
     if task == "send_daily_report":
         stats = fetch_daily_receipt(info, ADDR)
@@ -243,13 +304,13 @@ def executor_handler(event, context):
         # Clean Zombies
         risk.clean_global_zombies(portfolio, open_orders)
 
-        # 2. 🌐 THE LIVE SNAPSHOT
-        logger.info("📡 Pinging Hyperliquid for Top 50 assets & Live Meta Context...")
+        logger.info(f"🌐 THE LIVE SNAPSHOT ({timeframe})")
+        logger.info(f"📡 Pinging Hyperliquid for Top 50 assets & Live Meta Context...")
         top_50_symbols = get_hl_top_by_volume(50)
         live_ctx = get_live_meta_ctx()
         
-        logger.info("🐳 Fetching Live Sentiment from Binance...")
-        live_sentiment = get_bulk_binance_sentiment(top_50_symbols, period="15m")
+        logger.info(f"🐳 Fetching Live Sentiment from Binance ({timeframe})...")
+        live_sentiment = get_bulk_binance_sentiment(top_50_symbols, period=timeframe)
         
         db_conn = get_connection()
         
@@ -257,9 +318,9 @@ def executor_handler(event, context):
         live_rows = []
         
         # 3. 🧠 FEATURE GENERATION
-        logger.info("🧬 Generating Live Features (Klines + Strategies)...")
+        logger.info(f"🧬 Generating Live Features ({timeframe})...")
         
-        index_candles = get_latest_candles('BTC', interval='15m', limit=100)
+        index_candles = get_latest_candles('BTC', interval=timeframe, limit=100)
         if index_candles:
             index_df = pd.DataFrame(index_candles)
             index_df['timestamp'] = pd.to_datetime(index_df['timestamp'], unit='ms')
@@ -268,7 +329,7 @@ def executor_handler(event, context):
             index_df = None
         
         # Fetch all 50 assets concurrently in batches (takes ~5-10 seconds total)
-        bulk_candles = get_bulk_latest_candles(top_50_symbols, interval='15m', limit=100)
+        bulk_candles = get_bulk_latest_candles(top_50_symbols, interval=timeframe, limit=100)
         bulk_htf_candles = get_bulk_latest_candles(top_50_symbols, interval='4h', limit=50)
         
         for sym, candles in bulk_candles.items():
@@ -293,16 +354,62 @@ def executor_handler(event, context):
             
         mega_df = pd.concat(live_rows, ignore_index=True)
         
+        # 3.5 🌍 Inject Market Regime Features
+        logger.info("🌍 Injecting Market Regime features...")
+        if index_df is not None:
+            # We need at least 24 bars to compute these correctly
+            index_df['btc_ret_24'] = index_df['close'].pct_change(24)
+            index_df['btc_volatility_24'] = index_df['close'].pct_change().rolling(24).std()
+            
+            btc_ret_24 = index_df['btc_ret_24'].iloc[-1]
+            btc_vol_24 = index_df['btc_volatility_24'].iloc[-1]
+            
+            mega_df['btc_ret_24'] = btc_ret_24
+            mega_df['btc_volatility_24'] = btc_vol_24
+        else:
+            mega_df['btc_ret_24'] = 0.0
+            mega_df['btc_volatility_24'] = 0.0
+
+        if 'ret_12' in mega_df.columns:
+            mega_df['market_breadth'] = (mega_df['ret_12'] > 0).mean()
+        else:
+            mega_df['market_breadth'] = 0.5
+        
+        # PHASE 4: Regime Score
+        btc_ret_val = mega_df['btc_ret_24'].iloc[0] if 'btc_ret_24' in mega_df.columns else 0.0
+        btc_vol_val = mega_df['btc_volatility_24'].iloc[0] if 'btc_volatility_24' in mega_df.columns else 1e-9
+        mega_df['regime_score'] = abs(btc_ret_val) / (btc_vol_val + 1e-9)
+        
+        # PHASE 4: Macro Conviction Injection (4h model predictions)
+        if timeframe != '4h':
+            try:
+                macro_lgb_path = f'/tmp/cross_sectional_lgbm_4h.txt'
+                macro_s3 = S3Interface(AWS_BUCKET)
+                if macro_s3.download_file('models/cross_sectional_lgbm_4h.txt', macro_lgb_path):
+                    macro_model = lgb.Booster(model_file=macro_lgb_path)
+                    macro_features = macro_model.feature_name()
+                    # Build 4h-compatible features from live data and predict
+                    avail_macro = [f for f in macro_features if f in mega_df.columns]
+                    if len(avail_macro) >= len(macro_features) * 0.5:
+                        X_macro = mega_df[avail_macro].fillna(0.0)
+                        mega_df['macro_conviction_4h'] = macro_model.predict(X_macro)
+                        logger.info(f"🔮 Macro conviction injected ({len(avail_macro)}/{len(macro_features)} features)")
+                    else:
+                        mega_df['macro_conviction_4h'] = 0.0
+                        logger.warning(f"⚠️ Macro conviction: only {len(avail_macro)}/{len(macro_features)} features, using neutral")
+                else:
+                    mega_df['macro_conviction_4h'] = 0.0
+            except Exception as e:
+                logger.warning(f"⚠️ Macro conviction injection failed: {e}")
+                mega_df['macro_conviction_4h'] = 0.0
+        else:
+            mega_df['macro_conviction_4h'] = 0.0
+        
         # 4. 🥇 THE LIVE RANKING
         logger.info("⚖️ Applying Cross-Sectional Ranking...")
-        continuous_features = [
-            'rsi', 'macd', 'volatility_20', 'basis_pct', 'oi_usd', 'funding_rate', 
-            'sum_toptrader_long_short_ratio', 'corr_to_index',
-            'oi_delta_4', 'funding_delta_4', 'taker_buy_sell_ratio', 
-            'distance_from_ema_50', 'volatility_zscore', 'volume_zscore', 'relative_strength_btc',
-            'cvd_slope_5', 'price_cvd_divergence', 'sentiment_divergence',
-            'trend_convergence', 'bbw_squeeze', 'funding_basis_divergence'
-        ]
+        # M-3 FIX: Use canonical raw features for ranking
+        from analytics.cross_sectional import RAW_CONTINUOUS
+        continuous_features = RAW_CONTINUOUS
         
         # Fill NaN with 0 before ranking (NaN would be excluded from rank())
         for col in continuous_features:
@@ -311,42 +418,63 @@ def executor_handler(event, context):
         
         for col in continuous_features:
             if col in mega_df.columns:
+                # SAFE FALLBACK: If we have some values but not all (e.g. rate limit), 
+                # use the cross-sectional mean instead of 0 or NaN.
+                col_mean = mega_df[col].mean()
+                if pd.isna(col_mean): col_mean = 0.0
+                mega_df[col] = mega_df[col].fillna(col_mean)
+                
                 mega_df[f'rank_{col}'] = mega_df[col].rank(pct=True)
 
         # 5. 🤖 ENSEMBLE INFERENCE
         s3 = S3Interface(AWS_BUCKET)
-        lgb_path = '/tmp/cross_sectional_lgbm.txt'
-        xgb_path = '/tmp/cross_sectional_xgboost.json'
+        lgb_path = f'/tmp/cross_sectional_lgbm_{timeframe}.txt'
+        xgb_path = f'/tmp/cross_sectional_xgboost_{timeframe}.json'
+        ridge_path = f'/tmp/cross_sectional_ridge_{timeframe}.joblib'
         
-        logger.info("🧠 Downloading Ensemble Models (LGBM + XGB) from S3...")
-        success_lgb = s3.download_file('models/cross_sectional_lgbm.txt', lgb_path)
-        success_xgb = s3.download_file('models/cross_sectional_xgboost.json', xgb_path)
+        logger.info(f"🧠 Downloading Ensemble Models (LGBM + XGB + Ridge) from S3 for timeframe {timeframe}...")
+        success_lgb = s3.download_file(f'models/cross_sectional_lgbm_{timeframe}.txt', lgb_path)
+        success_xgb = s3.download_file(f'models/cross_sectional_xgboost_{timeframe}.json', xgb_path)
+        success_ridge = s3.download_file(f'models/cross_sectional_ridge_{timeframe}.joblib', ridge_path)
         
         ml_success = False
-        if success_lgb and success_xgb:
+        if success_lgb and success_xgb and success_ridge:
             try:
                 # Load Models
                 model_lgb = lgb.Booster(model_file=lgb_path)
                 model_xgb = xgb.XGBRegressor()
                 model_xgb.load_model(xgb_path)
+                model_ridge = joblib.load(ridge_path)
                 
-                # Prepare Features
-                feature_cols = [
-                    'rank_rsi', 'rank_macd', 'rank_volatility_20', 'rank_basis_pct', 'rank_oi_usd', 
-                    'rank_funding_rate', 'rank_sum_toptrader_long_short_ratio', 'rank_corr_to_index',
-                    'rank_oi_delta_4', 'rank_funding_delta_4', 'rank_taker_buy_sell_ratio',
-                    'rank_distance_from_ema_50', 'rank_volatility_zscore', 'rank_volume_zscore', 'rank_relative_strength_btc',
-                    'rank_cvd_slope_5', 'rank_price_cvd_divergence', 'rank_sentiment_divergence',
-                    'rank_trend_convergence', 'rank_bbw_squeeze', 'rank_funding_basis_divergence'
-                ]
-                time_features = ['hour_sin', 'hour_cos', 'day_sin', 'day_cos']
+                # Prepare Features (Asymmetric Pruning Match)
+                # M-3 FIX: Use canonical feature retrieval
+                from analytics.cross_sectional import get_feature_names
+                feature_cols, time_features = get_feature_names(timeframe)
+
                 X_live = mega_df[feature_cols + time_features]
                 
-                # Combined Prediction
-                preds_lgb = model_lgb.predict(X_live)
-                preds_xgb = model_xgb.predict(X_live)
-                mega_df['predicted_rank'] = (preds_lgb + preds_xgb) / 2.0
+                # Combined Prediction (Weighted Average: 40/40/20)
+                lgb_preds = model_lgb.predict(X_live)
+                xgb_preds = model_xgb.predict(X_live)
+                ridge_preds = model_ridge.predict(X_live)
                 
+                mega_df['predicted_rank'] = (0.4 * lgb_preds) + (0.4 * xgb_preds) + (0.2 * ridge_preds)
+                
+                # 🛡️ PHASE 4: Macro Safeguard
+                # If macro conviction is strong, dampen conflicting micro signals
+                if 'macro_conviction_4h' in mega_df.columns:
+                    # Conviction scale is usually around -1.0 to 1.0 (z-score like)
+                    # We dampen if they are opposite signs
+                    macro_sign = np.sign(mega_df['macro_conviction_4h'])
+                    micro_sign = np.sign(mega_df['predicted_rank'])
+                    
+                    # If they conflict, dampen micro signal by 30%
+                    conflict_mask = (macro_sign != micro_sign) & (abs(mega_df['macro_conviction_4h']) > 0.5)
+                    mega_df.loc[conflict_mask, 'predicted_rank'] *= 0.7
+                    
+                    if conflict_mask.any():
+                        logger.info(f"🛡️ Macro Safeguard: Dampened {conflict_mask.sum()} conflicting signals.")
+
                 logger.info("✅ Ensemble Inference Complete.")
                 ml_success = True
             except Exception as e:
@@ -357,9 +485,9 @@ def executor_handler(event, context):
             mega_df['predicted_rank'] = (mega_df['rank_rsi'] + mega_df['rank_macd']) / 2
 
         # 6. 🔪 SORT AND SLICE (Market Neutral Basket with Hysteresis)
-        BASKET_N = 3
-        HYSTERESIS_FACTOR = 3.0
-        buffer_n = int(BASKET_N * HYSTERESIS_FACTOR)  # =9, keeps coins if they stay in top 9/bottom 9
+        BASKET_N = 5
+        HYSTERESIS_FACTOR = 4.0
+        buffer_n = int(BASKET_N * HYSTERESIS_FACTOR)  # keeps coins if they stay in the buffer zone
         
         mega_df = mega_df.sort_values('predicted_rank', ascending=False)
         
@@ -437,7 +565,7 @@ def executor_handler(event, context):
                     if risk.check_execution_safety(target_coin, is_buy, current_price, poc_price):
                         logger.info(f"🚀 BASKET ENTRY: {signal} {target_coin}")
                         risk_parity_usd = symbol_to_usd.get(target_coin)
-                        risk.execute_logic(target_coin, signal, "15m", atr_pct, portfolio, user_state, open_orders, override_usd=risk_parity_usd)
+                        risk.execute_logic(target_coin, signal, timeframe, atr_pct, portfolio, user_state, open_orders, override_usd=risk_parity_usd)
                     else:
                         logger.warning(f"🛑 SAFETY REJECTION: {target_coin} failed pre-trade checks.")
                 else:

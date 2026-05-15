@@ -10,7 +10,19 @@ Alpha Factory is a **two-phase** system:
 
 1. **Local Research Hub** (Weekly) — Ingests years of Binance historical data (klines, index prices, OI, funding), trains a **LightGBM Cross-Sectional Ranking** model for pure alpha prediction, runs a **Walk-Forward OOS Dry Run Simulation** to validate the model's predictive power, and produces a **Glass-Box Intelligence Report** with AI-powered verdicts.
 
-2. **Cloud Execution Layer** (Hourly) — An autonomous **Live Inference Engine** pulls the LightGBM model from S3, ranks the top 100 Hyperliquid assets in real-time across momentum, correlation, and time-aware features, and manages a market-neutral portfolio (Top 3 Longs, Bottom 3 Shorts).
+2. **Cloud Execution Layer** (Hourly) — An autonomous **Live Inference Engine** pulls the LightGBM/XGB ensemble from S3, ranks the top 100 Hyperliquid assets in real-time using a **Hierarchical Macro-Shield**, and manages a concentrated portfolio (Top 5 Longs, Bottom 5 Shorts) with dynamic **Hysteresis-Based Rebalancing**.
+
+---
+
+## 💎 Institutional Alpha Features (Phase 4 Hardening)
+
+The system now implements advanced quant-finance patterns to eliminate bias and maximize predictive reliability:
+
+1. **Hierarchical Macro Injection**: Lower-timeframe models (15m, 1h) are anchored by 4h macro-conviction signals. This prevents the "Day Trader's Fallacy" by forcing short-term trades to align with the dominant market trend.
+2. **Leak-Free OOF Injection**: Uses a **3-Fold Walk-Forward Out-Of-Fold** pipeline for training. Macro signals are injected into training data using "blind" models that have never seen the target data, ensuring zero lookahead bias.
+3. **Magnitude-Aware Target Regression**: Instead of simple classification, the model predicts a **Hybrid Z-Score** (50% Raw Magnitude, 50% Risk-Adjusted Magnitude). This forces the model to prioritize "Big Movers" rather than just direction.
+4. **Regime-Conditional Scaling**: All features and weights are scaled based on the **Market Regime Score** (derived from BTC 24h trend/volatility), allowing the bot to pivot between Momentum and Mean-Reversion.
+5. **Macro Risk Safeguard**: Live trades are automatically dampened if the 15m signal conflicts with the 4h conviction, protecting the portfolio during macro reversals.
 
 ### Data Purity Policy
 All historical and live-edge data is sourced **exclusively from Binance** (API + Vision archives). Hyperliquid is used only for execution, tradability filtering, and live market context — never as a data source for the research database.
