@@ -31,7 +31,12 @@ class AssetManager:
         logger.error("🚨 FATAL: Could not load exchange rules. Bot will likely fail size routing.")
 
     def get_price_precision(self, coin, price):
-        return float(f"{float(price):.5g}")
+        # Hyperliquid is extremely strict with price decimals.
+        # For almost all assets, 5 significant figures is the maximum.
+        # If the price is very small, we also cap the absolute decimal places.
+        rounded = float(f"{price:.5g}")
+        # Secondary safety: never exceed 6 decimal places for any asset
+        return round(rounded, 6)
 
     def round_size(self, coin, size):
         safe_coin = str(coin).upper().strip()

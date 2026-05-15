@@ -19,25 +19,28 @@ class RiskEngine:
     def get_unified_equity(self):
         """
         Calculates true net equity for Unified Accounts.
-        Sums Spot USDC balance + Perps Unrealized PnL.
+        Prioritizes crossMarginSummary (Unified) then marginSummary (Legacy).
         """
         try:
-            # 1. Get Spot Balances
-            spot_state = self.info.spot_user_state(self.address)
-            spot_usdc = sum(float(b['total']) for b in spot_state.get('balances', []) if b['coin'] == 'USDC')
-            
-            # 2. Get Perps State (for Margin and UnPnL)
             user_state = self.info.user_state(self.address)
+            
+            # 1. Check for Unified vs Legacy summary
             summary = user_state.get('crossMarginSummary') or user_state.get('marginSummary', {})
+            account_value = float(summary.get('accountValue', 0))
             used_margin = float(summary.get('totalMarginUsed', 0))
             
-            # 3. Aggregate Unrealized PnL
-            unrealized_pnl = 0
-            for p in user_state.get('assetPositions', []):
-                unrealized_pnl += float(p['position'].get('unrealizedPnl', 0))
-            
-            total_equity = spot_usdc + unrealized_pnl
-            return total_equity, used_margin, user_state
+            # 2. Safety Fallback: If summary is somehow empty, try summing Spot + PnL
+            if account_value == 0:
+                spot_state = self.info.spot_user_state(self.address)
+                spot_usdc = sum(float(b['total']) for b in spot_state.get('balances', []) if b['coin'] == 'USDC')
+                
+                unrealized_pnl = 0
+                for p in user_state.get('assetPositions', []):
+                    unrealized_pnl += float(p['position'].get('unrealizedPnl', 0))
+                
+                account_value = spot_usdc + unrealized_pnl
+                
+            return account_value, used_margin, user_state
         except Exception as e:
             logger.error(f"❌ Failed to fetch unified equity: {e}")
             return 0, 0, {}
@@ -155,8 +158,8 @@ class RiskEngine:
         oi_usd = sensor['oi_usd']
         funding = sensor['funding_rate']
         
-        # 2. RULE 1: The Liquidity Floor ($10M Minimum)
-        MIN_OI = 10_000_000 
+        # 2. RULE 1: The Liquidity Floor ($3M Minimum)
+        MIN_OI = 3_000_000 
         if oi_usd < MIN_OI:
             logger.warning(f"🛑 REJECTED: {coin} OI is only ${oi_usd:,.0f} (Needs ${MIN_OI:,.0f}). Danger of slippage.")
             return False

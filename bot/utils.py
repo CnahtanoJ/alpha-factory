@@ -18,10 +18,18 @@ class S3Interface:
             return json.loads(response['Body'].read().decode('utf-8'))
         except ClientError: return {}
 
+    def download_json(self, filename):
+        """Alias for load_json to match executor expectations."""
+        return self.load_json(filename)
+
     def save_json(self, filename, data):
         try:
             self.s3.put_object(Bucket=self.bucket, Key=filename, Body=json.dumps(data, indent=4))
         except Exception as e: logger.error(f"S3 Save Error: {e}")
+
+    def upload_json(self, filename, data):
+        """Alias for save_json to match executor expectations."""
+        return self.save_json(filename, data)
 
     def download_file(self, s3_key, local_path):
         """Downloads a raw file (like a .txt model) from S3 to local disk."""
@@ -58,29 +66,47 @@ class StateManager:
 
 def send_telegram_message(text):
     """
-    Sends a message to Telegram, automatically splitting it if it exceeds the 4096-char limit.
-    Uses Markdown formatting.
+    Sends a message to Telegram, automatically splitting it at newlines if it exceeds 
+    the 4096-char limit to preserve Markdown formatting integrity.
     """
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         logger.warning("Telegram credentials missing. Skipping message.")
         return
 
-    MAX_LENGTH = 4000 # Safety margin
+    MAX_LENGTH = 4000
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     
-    # Split message into chunks if necessary
-    chunks = [text[i:i + MAX_LENGTH] for i in range(0, len(text), MAX_LENGTH)]
-    
-    for chunk in chunks:
+    # Smart splitting by newline to avoid breaking Markdown blocks/tables
+    if len(text) <= MAX_LENGTH:
+        chunks = [text]
+    else:
+        chunks = []
+        current_chunk = ""
+        for line in text.split('\n'):
+            if len(current_chunk) + len(line) + 1 > MAX_LENGTH:
+                chunks.append(current_chunk.strip())
+                current_chunk = line + '\n'
+            else:
+                current_chunk += line + '\n'
+        if current_chunk:
+            chunks.append(current_chunk.strip())
+
+    for i, chunk in enumerate(chunks):
         payload = {
             "chat_id": TELEGRAM_CHAT_ID, 
             "text": chunk, 
-            "parse_mode": "Markdown" # MarkdownV2 is too strict for long automated reports
+            "parse_mode": "Markdown",
+            "disable_web_page_preview": True
         }
         try:
-            requests.post(url, json=payload, timeout=15)
+            response = requests.post(url, json=payload, timeout=15)
+            if response.status_code != 200:
+                logger.error(f"❌ Telegram API Error (Chunk {i+1}): {response.text}")
+                # Fallback to plain text if Markdown fails
+                payload["parse_mode"] = ""
+                requests.post(url, json=payload, timeout=15)
         except Exception as e:
-            logger.error(f"❌ Telegram error: {e}")
+            logger.error(f"❌ Telegram Connection error: {e}")
 
 def send_telegram_receipt(stats):
     # Emojis based on profitability 

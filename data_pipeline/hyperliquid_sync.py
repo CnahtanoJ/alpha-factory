@@ -44,27 +44,23 @@ def get_hl_symbol_map(testnet=False):
         print(f"Error building HL symbol map: {e}")
         return {}
 
-def get_latest_candles(symbol, interval='1h', limit=100, testnet=False):
+def get_latest_candles(symbol, interval='1h', limit=200, testnet=False, info=None):
     """
     Fetches the latest OHLCV candles from Hyperliquid REST API (perpetual futures).
-    Symbol can be either 'BTC' or 'BTC/USDT' format.
     """
-    # Normalize: accept both 'BTC' and 'BTC/USDT'
     hl_api_string = symbol.split('/')[0]
     
-    url = constants.TESTNET_API_URL if testnet else constants.MAINNET_API_URL
-    info = Info(url, skip_ws=True)
+    if info is None:
+        url = constants.TESTNET_API_URL if testnet else constants.MAINNET_API_URL
+        info = Info(url, skip_ws=True)
     
-    # HL expects timestamps in ms
     end_time = int(time.time() * 1000)
     
     for attempt in range(3):
         try:
             candles = info.candles_snapshot(hl_api_string, interval, 0, end_time)
             if candles:
-                # Take the most recent 'limit'
                 latest = candles[-limit:]
-                
                 formatted = []
                 for c in latest:
                     formatted.append({
@@ -80,42 +76,41 @@ def get_latest_candles(symbol, interval='1h', limit=100, testnet=False):
                     })
                 return formatted
             
-            # If empty, sleep and retry
+            # If empty but no error, wait and retry
             time.sleep(1.0 * (2 ** attempt))
             
         except Exception as e:
-            print(f"Error fetching HL candles for {symbol} ({hl_api_string}) [Attempt {attempt+1}]: {e}")
-            time.sleep(1.0 * (2 ** attempt))
+            # Handle 429 Rate Limit specifically
+            error_str = str(e)
+            if "429" in error_str:
+                # Heavy backoff for 429
+                wait_time = 5.0 * (2 ** attempt)
+                print(f"⚠️ Rate limit hit for {symbol}. Backing off {wait_time}s...")
+                time.sleep(wait_time)
+            else:
+                print(f"Error fetching HL candles for {symbol} ({hl_api_string}) [Attempt {attempt+1}]: {e}")
+                time.sleep(1.0 * (2 ** attempt))
             
     return []
 
-def get_bulk_latest_candles(symbols, interval='15m', limit=100, testnet=False, batch_size=10, delay=0.5):
+def get_bulk_latest_candles(symbols, interval='15m', limit=200, testnet=False, delay=1.5):
     """
-    Fetches candles for multiple symbols concurrently in batches.
-    Significantly faster than sequential fetching while respecting rate limits.
+    Fetches candles for multiple symbols strictly sequentially with a delay between every request.
+    This is slower but ensures maximum data integrity and avoids rate limit issues.
     """
-    from concurrent.futures import ThreadPoolExecutor
-    
     results = {}
+    url = constants.TESTNET_API_URL if testnet else constants.MAINNET_API_URL
+    shared_info = Info(url, skip_ws=True)
     
-    def fetch_single(sym):
-        return sym, get_latest_candles(sym, interval, limit, testnet)
-
-    for i in range(0, len(symbols), batch_size):
-        batch = symbols[i:i+batch_size]
+    total = len(symbols)
+    for i, sym in enumerate(symbols):
+        print(f"📊 Fetching {sym} ({i+1}/{total})...")
+        sym, candles = sym, get_latest_candles(sym, interval, limit, testnet, info=shared_info)
+        if candles:
+            results[sym] = candles
         
-        with ThreadPoolExecutor(max_workers=batch_size) as executor:
-            futures = [executor.submit(fetch_single, sym) for sym in batch]
-            for future in futures:
-                try:
-                    sym, candles = future.result()
-                    if candles:
-                        results[sym] = candles
-                except Exception as e:
-                    print(f"Bulk fetch error for {sym}: {e}")
-                    
-        # Rate limiting pause between batches
-        if i + batch_size < len(symbols):
+        # Mandatory delay between EVERY single request
+        if i < total - 1:
             time.sleep(delay)
             
     return results

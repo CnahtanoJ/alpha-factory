@@ -1,3 +1,7 @@
+import inspect
+if not hasattr(inspect, 'getargspec'):
+    inspect.getargspec = lambda func: inspect.getfullargspec(func)[:4]
+
 import os
 import json
 import time
@@ -92,12 +96,13 @@ class LiveInferenceEngine:
         global_retail = np.nan
         
         if self.live_sentiment and symbol in self.live_sentiment:
-            # Sync with Binance API dict keys
+            # Sync with Binance API dict keys, ensuring we get floats or NaNs, not None
             top_trader = self.live_sentiment[symbol].get('top_trader_ratio')
             global_retail = self.live_sentiment[symbol].get('long_short_ratio')
-            
-        df['sum_toptrader_long_short_ratio'] = top_trader
-        df['sum_long_short_ratio'] = global_retail
+        
+        # Ensure we have floats/NaNs to avoid NoneType errors during diff()
+        df['sum_toptrader_long_short_ratio'] = pd.to_numeric(top_trader, errors='coerce')
+        df['sum_long_short_ratio'] = pd.to_numeric(global_retail, errors='coerce')
         
         # Fallback to neutral cross-sectional mean (later in the pipeline)
         if pd.notna(top_trader) and pd.notna(global_retail):
@@ -330,7 +335,11 @@ def executor_handler(event, context):
             logger.info(f"🐳 Fetching Live Sentiment from Binance ({timeframe})...")
             live_sentiment = get_bulk_binance_sentiment(top_50_symbols, period=timeframe)
             
-            db_conn = get_connection()
+            try:
+                db_conn = get_connection()
+            except Exception as e:
+                logger.warning(f"⚠️ Could not connect to local database: {e}. Proceeding without historical DB features.")
+                db_conn = None
             engine = LiveInferenceEngine(info, conn=db_conn, live_sentiment=live_sentiment)
             live_rows = []
         

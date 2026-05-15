@@ -340,12 +340,20 @@ def cmd_health(args):
         addr = addr.strip()
 
         try:
-            # Try to fetch user state
+            # Try to fetch user state with Unified Logic
             user_state = info.user_state(addr)
-            margin = user_state.get('marginSummary', {}).get('accountValue', '0')
+            summary = user_state.get('crossMarginSummary') or user_state.get('marginSummary', {})
+            margin = float(summary.get('accountValue', 0))
+            
+            # Fallback if accountValue is 0 (Unified check)
+            if margin == 0:
+                spot_state = info.spot_user_state(addr)
+                spot_usdc = sum(float(b['total']) for b in spot_state.get('balances', []) if b['coin'] == 'USDC')
+                margin = spot_usdc
+            
             print(f"  ✅ Status: ONLINE ({mode})")
             print(f"  📍 Address: {addr[:6]}...{addr[-4:]}")
-            print(f"  💰 Account Value: ${float(margin):,.2f}")
+            print(f"  💰 Account Value: ${margin:,.2f}")
         except Exception as e:
             print(f"  ❌ Status: ERROR (Connection failed: {e})")
 
