@@ -155,6 +155,17 @@ def save_active_regime(all_results):
         print(f"\n👑 REGIME SWITCHER: Selected '{best_tf}' as the optimal timeframe (Sharpe: {best_sharpe:.2f}, Spearman: {best_spearman:.4f})")
         print(f"   Saved to {config_path}")
 
+        # PHASE 2: Upload to S3 so Lambda knows which timeframe is active
+        try:
+            import boto3
+            from bot.config import AWS_BUCKET
+            s3 = boto3.client('s3')
+            with open(config_path, 'rb') as data:
+                s3.put_object(Bucket=AWS_BUCKET, Key='live_config.json', Body=data.read())
+            print(f"   ✅ live_config.json uploaded to S3 bucket '{AWS_BUCKET}'.")
+        except Exception as e:
+            print(f"   ⚠️ live_config.json S3 upload failed: {e}")
+
 def cmd_report(args):
     """Run the Weekly Intelligence Cycle: OOS Simulate → Train → Report"""
     
@@ -197,6 +208,15 @@ def cmd_report(args):
     
     if report_path:
         print(f"\n✅ Report saved to: {report_path}")
+        
+        # PHASE 3: Send to Telegram
+        if args.ping_telegram:
+            print("📱 Sending report to Telegram...")
+            from bot.utils import send_telegram_message
+            with open(report_path, 'r', encoding='utf-8') as f:
+                report_content = f.read()
+            send_telegram_message(report_content)
+            print("   ✅ Telegram transmission complete.")
 
 
 def cmd_full(args):
@@ -239,8 +259,17 @@ def cmd_full(args):
 
     if all_results:
         print("\n📊 Generating Aggregated Intelligence Report...")
-        generate_report(all_results)
+        report_path = generate_report(all_results)
         save_active_regime(all_results)
+
+        # PHASE 3: Send to Telegram
+        if args.ping_telegram:
+            print("📱 Sending report to Telegram...")
+            from bot.utils import send_telegram_message
+            with open(report_path, 'r', encoding='utf-8') as f:
+                report_content = f.read()
+            send_telegram_message(report_content)
+            print("   ✅ Telegram transmission complete.")
     
     print(f"\n✅ AI Intelligence Cycle Complete!")
 
@@ -441,6 +470,8 @@ Recommended first-time workflow:
                        help='Run Optuna Hyperparameter Optimization before training')
         p.add_argument('--trials', type=int, default=50, dest='trials',
                        help='Number of Optuna trials to run if --optimize is set (default: 50)')
+        p.add_argument('--ping', action='store_true', dest='ping_telegram',
+                       help='Send the generated report to Telegram')
 
     # ── report ──
     p_report = subparsers.add_parser('report', help='Run intelligence cycle + generate report')

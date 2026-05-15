@@ -1,1 +1,1 @@
-# formalize the analytics package
+# analytics package initialization
