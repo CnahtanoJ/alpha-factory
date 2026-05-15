@@ -306,6 +306,9 @@ def cmd_health(args):
         if not key or not addr:
             print(f"  ❌ Status: OFFLINE (Missing Keys for _{suffix})")
             continue
+            
+        key = key.strip()
+        addr = addr.strip()
 
         try:
             # Try to fetch user state
