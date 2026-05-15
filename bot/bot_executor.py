@@ -260,12 +260,10 @@ def executor_handler(event, context):
     now_ts = int(time.time())
     mins_since_rebalance = (now_ts - last_rebalance) / 60
     
-    task = event.get("task") 
-    if not task:
-        if mins_since_rebalance >= rebalance_window_mins:
-            task = "rebalance"
-        else:
-            task = "manage_tpsl"
+    if mins_since_rebalance >= rebalance_window_mins:
+        task = "rebalance"
+    else:
+        task = event.get("task") 
 
     logger.info(f"🤖 Autonomous Decision: {task} | Timeframe: {timeframe} | Since Last: {mins_since_rebalance:.1f}m")
 
