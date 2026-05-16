@@ -713,10 +713,13 @@ def train_ensemble_models(mega_df, optimized_params=None, timeframe='15m'):
     
     return (model_lgb, model_xgb, model_ridge), features, spearman_corr, p_value, rmse
 
-def upload_ensemble_to_s3(timeframe='15m'):
-    """Explicitly upload the trained ensemble to S3 after validation."""
-    if not boto3:
-        print("⚠️ boto3 not available. Skipping S3 upload.")
+def upload_ensemble_to_s3(timeframe='15m', meta_only=False):
+    """Explicitly upload the trained ensemble (or just metadata) to S3."""
+    try:
+        import boto3
+        from bot.config import AWS_BUCKET
+    except ImportError:
+        print("⚠️ boto3 or AWS config not available. Skipping S3 upload.")
         return False
         
     lgb_path = os.path.join(MODEL_DIR, f'cross_sectional_lgbm_{timeframe}.txt')
@@ -726,11 +729,14 @@ def upload_ensemble_to_s3(timeframe='15m'):
     
     s3 = boto3.client('s3')
     try:
-        s3.upload_file(lgb_path, AWS_BUCKET, f'models/cross_sectional_lgbm_{timeframe}.txt')
-        s3.upload_file(xgb_path, AWS_BUCKET, f'models/cross_sectional_xgboost_{timeframe}.json')
-        s3.upload_file(ridge_path, AWS_BUCKET, f'models/cross_sectional_ridge_{timeframe}.joblib')
+        if not meta_only:
+            s3.upload_file(lgb_path, AWS_BUCKET, f'models/cross_sectional_lgbm_{timeframe}.txt')
+            s3.upload_file(xgb_path, AWS_BUCKET, f'models/cross_sectional_xgboost_{timeframe}.json')
+            s3.upload_file(ridge_path, AWS_BUCKET, f'models/cross_sectional_ridge_{timeframe}.joblib')
+            print(f"✅ Ensemble Models (LGBM+XGB+Ridge) uploaded to S3.")
+            
         s3.upload_file(meta_path, AWS_BUCKET, f'models/cross_sectional_lgbm_{timeframe}_meta.json')
-        print(f"✅ Ensemble Models (LGBM+XGB+Ridge) uploaded to S3 bucket '{AWS_BUCKET}'.")
+        print(f"✅ Metadata uploaded to S3 (Spearman check active).")
         return True
     except Exception as e:
         print(f"⚠️ S3 upload failed: {e}")

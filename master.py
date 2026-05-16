@@ -168,8 +168,27 @@ def save_active_regime(all_results):
 
 def cmd_report(args):
     """Run the Weekly Intelligence Cycle: OOS Simulate → Train → Report"""
+    os.makedirs('logs', exist_ok=True)
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H%M")
+    log_file = os.path.join('logs', f"report_{timestamp}.log")
     
+    log_f = open(log_file, 'a', encoding='utf-8')
+    original_stdout = sys.stdout
+    original_stderr = sys.stderr
+    
+    sys.stdout = Tee(sys.stdout, log_f)
+    sys.stderr = Tee(sys.stderr, log_f)
+    
+    try:
+        print(f"📝 Logging session started: {log_file}")
+        _run_report_logic(args)
+    finally:
+        print(f"📝 Logging session finished: {log_file}")
+        sys.stdout = original_stdout
+        sys.stderr = original_stderr
+        log_f.close()
 
+def _run_report_logic(args):
     from analytics.weekly_orchestrator import run_weekly_cycle
     from analytics.generate_report import generate_report
     
@@ -221,6 +240,27 @@ def cmd_report(args):
 
 def cmd_full(args):
     """Run the full weekly cycle: Ingest (Optional) → Sync → OOS Simulate → Train → Report"""
+    os.makedirs('logs', exist_ok=True)
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H%M")
+    log_file = os.path.join('logs', f"full_cycle_{timestamp}.log")
+    
+    log_f = open(log_file, 'a', encoding='utf-8')
+    original_stdout = sys.stdout
+    original_stderr = sys.stderr
+    
+    sys.stdout = Tee(sys.stdout, log_f)
+    sys.stderr = Tee(sys.stderr, log_f)
+    
+    try:
+        print(f"📝 Logging session started: {log_file}")
+        _run_full_logic(args)
+    finally:
+        print(f"📝 Logging session finished: {log_file}")
+        sys.stdout = original_stdout
+        sys.stderr = original_stderr
+        log_f.close()
+
+def _run_full_logic(args):
     from analytics.weekly_orchestrator import run_weekly_cycle
     from analytics.generate_report import generate_report
     

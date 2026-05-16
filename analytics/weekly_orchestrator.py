@@ -298,6 +298,7 @@ def run_weekly_cycle(
             
     spearman_corr = model_meta.get('validation_spearman', 0)
     
+    gatekeeper_passed = True
     if spearman_corr < 0.02:
         logger.warning(f"🚨 GATEKEEPER REJECTION: Spearman={spearman_corr:.4f} is too low.")
         logger.info("🔄 Triggering Optuna HPO to find a more robust model...")
@@ -316,15 +317,20 @@ def run_weekly_cycle(
         
         if spearman_corr < 0.02:
             logger.error(f"❌ OPTIMIZATION FAILED: Spearman={spearman_corr:.4f} still below threshold.")
-            logger.error("🛑 CRITICAL: Deployment aborted to protect capital.")
-            return {'status': 'FAIL', 'reason': 'Spearman correlation below threshold even after HPO.'}
+            logger.error("🛑 CRITICAL: Deployment blocked to protect capital. Generating report for analysis...")
+            gatekeeper_passed = False
         else:
             logger.info(f"✅ OPTIMIZATION SUCCESS: New Spearman={spearman_corr:.4f}")
 
     # ─── SECURE DEPLOYMENT ───
-    # We only upload to S3 if the model survived the gatekeeper.
-    logger.info("🔒 GATEKEEPER PASSED. Uploading models to S3...")
-    upload_ensemble_to_s3(timeframe)
+    # We always upload the metadata so the bot knows the current model status.
+    # We only upload the actual model binaries if the gatekeeper passed.
+    if gatekeeper_passed:
+        logger.info("🔒 GATEKEEPER PASSED. Uploading models to S3...")
+        upload_ensemble_to_s3(timeframe, meta_only=False)
+    else:
+        logger.warning("⚠️ GATEKEEPER REJECTED: Uploading 'Bad' Metadata to S3 to trigger Bot Panic Switch (HALT).")
+        upload_ensemble_to_s3(timeframe, meta_only=True)
 
     # =========================================================
     # STEP 3: EXTRACT FEATURE IMPORTANCE
