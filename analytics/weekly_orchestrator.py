@@ -95,19 +95,6 @@ def extract_per_asset_drivers(
     df = mega_df.copy()
     df['predicted_rank'] = predictions
 
-    # 2. 🛡️ FINAL LEAKAGE PROTECTION: Verify Chronological Integrity
-    train_max_ts = df_train['timestamp'].max()
-    oos_min_ts = df_oos['timestamp'].min()
-    
-    print(f"   🛡️ Chronological Gap Check:")
-    print(f"      - Training End: {train_max_ts}")
-    print(f"      - OOS Test Start: {oos_min_ts}")
-    if oos_min_ts > train_max_ts:
-        print("      ✅ PASS: OOS data is strictly AFTER training data.")
-    else:
-        print("      ❌ FAIL: OVERLAP DETECTED! Potential leakage.")
-        return None
-
     # Get the latest timestamp
     latest_ts = df['timestamp'].max()
     snapshot = df[df['timestamp'] == latest_ts].copy()

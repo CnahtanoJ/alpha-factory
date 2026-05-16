@@ -1,6 +1,6 @@
 {
-    "active_timeframe": "4h",
-    "sharpe": 2.8161,
-    "spearman": 0.040206791043694345,
-    "updated_at": "2026-05-15T17:30:12.028235"
+    "active_timeframe": "1h",
+    "sharpe": 0.0,
+    "spearman": 0.048629798342060236,
+    "updated_at": "2026-05-16T23:52:56.414797"
 }
