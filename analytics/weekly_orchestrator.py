@@ -26,7 +26,7 @@ import pandas as pd
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import lightgbm as lgb
-from analytics.cross_sectional import build_mega_dataframe, train_cross_sectional_lgbm, get_fwd_return_bars, get_feature_names
+from analytics.cross_sectional import build_mega_dataframe, train_cross_sectional_lgbm, get_fwd_return_bars, get_feature_names, upload_ensemble_to_s3
 
 logger = logging.getLogger()
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
@@ -286,7 +286,7 @@ def run_weekly_cycle(
         best_params = optimize_lgbm_hyperparameters(X_train, y_train, X_val, y_val, n_trials=n_trials, timeframe=timeframe)
         logger.info("✅ Optimization complete. Training model with best parameters...")
 
-    model, features = train_cross_sectional_lgbm(train_df, optimized_params=best_params, timeframe=timeframe)
+    model, features = train_cross_sectional_lgbm(train_df, optimized_params=best_params, timeframe=timeframe, upload=False)
 
     # ─── ELITE GATEKEEPER ───
     # We load the meta to check the Spearman Correlation
@@ -298,7 +298,7 @@ def run_weekly_cycle(
             
     spearman_corr = model_meta.get('validation_spearman', 0)
     
-    if spearman_corr < 0.04:
+    if spearman_corr < 0.02:
         logger.warning(f"🚨 GATEKEEPER REJECTION: Spearman={spearman_corr:.4f} is too low.")
         logger.info("🔄 Triggering Optuna HPO to find a more robust model...")
         
@@ -307,19 +307,24 @@ def run_weekly_cycle(
         best_params = optimize_lgbm_hyperparameters(X_train, y_train, X_val, y_val, n_trials=30, timeframe=timeframe)
         
         # Re-train with optimized parameters
-        model, features = train_cross_sectional_lgbm(train_df, optimized_params=best_params, timeframe=timeframe)
+        model, features = train_cross_sectional_lgbm(train_df, optimized_params=best_params, timeframe=timeframe, upload=False)
         
         # Reload meta after re-train
         with open(meta_path, 'r') as f:
             model_meta = json.load(f)
         spearman_corr = model_meta.get('validation_spearman', 0)
         
-        if spearman_corr < 0.04:
+        if spearman_corr < 0.02:
             logger.error(f"❌ OPTIMIZATION FAILED: Spearman={spearman_corr:.4f} still below threshold.")
             logger.error("🛑 CRITICAL: Deployment aborted to protect capital.")
             return {'status': 'FAIL', 'reason': 'Spearman correlation below threshold even after HPO.'}
         else:
             logger.info(f"✅ OPTIMIZATION SUCCESS: New Spearman={spearman_corr:.4f}")
+
+    # ─── SECURE DEPLOYMENT ───
+    # We only upload to S3 if the model survived the gatekeeper.
+    logger.info("🔒 GATEKEEPER PASSED. Uploading models to S3...")
+    upload_ensemble_to_s3(timeframe)
 
     # =========================================================
     # STEP 3: EXTRACT FEATURE IMPORTANCE

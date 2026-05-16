@@ -713,7 +713,30 @@ def train_ensemble_models(mega_df, optimized_params=None, timeframe='15m'):
     
     return (model_lgb, model_xgb, model_ridge), features, spearman_corr, p_value, rmse
 
-def train_cross_sectional_lgbm(mega_df, optimized_params=None, timeframe='15m'):
+def upload_ensemble_to_s3(timeframe='15m'):
+    """Explicitly upload the trained ensemble to S3 after validation."""
+    if not boto3:
+        print("⚠️ boto3 not available. Skipping S3 upload.")
+        return False
+        
+    lgb_path = os.path.join(MODEL_DIR, f'cross_sectional_lgbm_{timeframe}.txt')
+    xgb_path = os.path.join(MODEL_DIR, f'cross_sectional_xgboost_{timeframe}.json')
+    ridge_path = os.path.join(MODEL_DIR, f'cross_sectional_ridge_{timeframe}.joblib')
+    meta_path = os.path.join(MODEL_DIR, f'cross_sectional_lgbm_{timeframe}_meta.json')
+    
+    s3 = boto3.client('s3')
+    try:
+        s3.upload_file(lgb_path, AWS_BUCKET, f'models/cross_sectional_lgbm_{timeframe}.txt')
+        s3.upload_file(xgb_path, AWS_BUCKET, f'models/cross_sectional_xgboost_{timeframe}.json')
+        s3.upload_file(ridge_path, AWS_BUCKET, f'models/cross_sectional_ridge_{timeframe}.joblib')
+        s3.upload_file(meta_path, AWS_BUCKET, f'models/cross_sectional_lgbm_{timeframe}_meta.json')
+        print(f"✅ Ensemble Models (LGBM+XGB+Ridge) uploaded to S3 bucket '{AWS_BUCKET}'.")
+        return True
+    except Exception as e:
+        print(f"⚠️ S3 upload failed: {e}")
+        return False
+
+def train_cross_sectional_lgbm(mega_df, optimized_params=None, timeframe='15m', upload=True):
     """Main entry point for training and persisting the ensemble."""
     timestamp_str = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d_%H%M%S")
     os.makedirs(MODEL_DIR, exist_ok=True)
@@ -741,11 +764,20 @@ def train_cross_sectional_lgbm(mega_df, optimized_params=None, timeframe='15m'):
         })
     combined_importance.sort(key=lambda x: x['combined_importance'], reverse=True)
     
+    # Load actual parameters for metadata persistence
+    actual_params = optimized_params
+    if actual_params is None:
+        params_path = get_params_path(timeframe)
+        if os.path.exists(params_path):
+            with open(params_path, 'r') as f:
+                actual_params = json.load(f)
+
     # Save Metadata
     with open(meta_path, 'w') as f:
         json.dump({
             'timestamp': timestamp_str,
             'is_ensemble': True,
+            'best_params': actual_params,
             'validation_spearman': float(spearman_corr),
             'validation_rmse': float(rmse),
             'spearman_p_value': float(p_value),
@@ -758,16 +790,8 @@ def train_cross_sectional_lgbm(mega_df, optimized_params=None, timeframe='15m'):
     joblib.dump(model_ridge, ridge_path)
     
     # Upload to S3
-    if boto3:
-        s3 = boto3.client('s3')
-        try:
-            s3.upload_file(lgb_path, AWS_BUCKET, f'models/cross_sectional_lgbm_{timeframe}.txt')
-            s3.upload_file(xgb_path, AWS_BUCKET, f'models/cross_sectional_xgboost_{timeframe}.json')
-            s3.upload_file(ridge_path, AWS_BUCKET, f'models/cross_sectional_ridge_{timeframe}.joblib')
-            s3.upload_file(meta_path, AWS_BUCKET, f'models/cross_sectional_lgbm_{timeframe}_meta.json')
-            print(f"✅ Ensemble Models (LGBM+XGB+Ridge) uploaded to S3 bucket '{AWS_BUCKET}'.")
-        except Exception as e:
-            print(f"⚠️ S3 upload failed: {e}")
+    if upload and boto3:
+        upload_ensemble_to_s3(timeframe)
             
     return model_lgb, features # Legacy return for some callers
 

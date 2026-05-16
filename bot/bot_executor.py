@@ -388,9 +388,20 @@ def executor_handler(event, context):
             
             if timeframe != '4h':
                 try:
-                    macro_lgb_path = f'/tmp/cross_sectional_lgbm_4h.txt'
                     macro_s3 = S3Interface(AWS_BUCKET)
-                    if macro_s3.download_file('models/cross_sectional_lgbm_4h.txt', macro_lgb_path):
+                    macro_meta_path = '/tmp/cross_sectional_lgbm_4h_meta.json'
+                    macro_valid = False
+                    
+                    if macro_s3.download_file('models/cross_sectional_lgbm_4h_meta.json', macro_meta_path):
+                        with open(macro_meta_path, 'r') as f:
+                            m_meta = json.load(f)
+                        if m_meta.get('validation_spearman', 0.0) >= 0.02:
+                            macro_valid = True
+                        else:
+                            logger.warning(f"⚠️ Macro (4h) model failed safety check (Spearman < 0.02). Neutralizing macro conviction.")
+                    
+                    macro_lgb_path = '/tmp/cross_sectional_lgbm_4h.txt'
+                    if macro_valid and macro_s3.download_file('models/cross_sectional_lgbm_4h.txt', macro_lgb_path):
                         macro_model = lgb.Booster(model_file=macro_lgb_path)
                         macro_features = macro_model.feature_name()
                         avail_macro = [f for f in macro_features if f in mega_df.columns]
@@ -417,6 +428,23 @@ def executor_handler(event, context):
                     mega_df[f'rank_{col}'] = mega_df[col].rank(pct=True)
 
             s3 = S3Interface(AWS_BUCKET)
+            
+            # ─── THE PANIC SWITCH ───
+            # Layer 2 Defense: Check model meta before downloading models
+            meta_path = f'/tmp/cross_sectional_lgbm_{timeframe}_meta.json'
+            if s3.download_file(f'models/cross_sectional_lgbm_{timeframe}_meta.json', meta_path):
+                with open(meta_path, 'r') as f:
+                    model_meta = json.load(f)
+                validation_spearman = model_meta.get('validation_spearman', 0.0)
+                if validation_spearman < 0.02:
+                    logger.error(f"🛑 PANIC SWITCH: Validation Spearman ({validation_spearman:.4f}) < 0.02. Aborting trades.")
+                    send_telegram_message(f"🛑 PANIC SWITCH: Validation Spearman ({validation_spearman:.4f}) < 0.02. Trading suspended for {timeframe}.")
+                    
+                    # Update state so we don't spam the API/Telegram
+                    config["last_rebalance_ts"] = int(time.time())
+                    s3.upload_json("live_config.json", config)
+                    return {'statusCode': 400, 'body': 'Trading suspended due to low model conviction'}
+            
             lgb_path = f'/tmp/cross_sectional_lgbm_{timeframe}.txt'
             xgb_path = f'/tmp/cross_sectional_xgboost_{timeframe}.json'
             ridge_path = f'/tmp/cross_sectional_ridge_{timeframe}.joblib'
