@@ -326,6 +326,23 @@ def executor_handler(event, context):
         elif task == "rebalance":
             if not risk.check_safety(): return {'statusCode': 400, 'body': 'Safety failed'}
             
+            # ─── THE PANIC SWITCH (Layer 2) ───
+            # Check model meta BEFORE fetching data to save bandwidth and time
+            s3 = S3Interface(AWS_BUCKET)
+            meta_path = f'/tmp/cross_sectional_lgbm_{timeframe}_meta.json'
+            if s3.download_file(f'models/cross_sectional_lgbm_{timeframe}_meta.json', meta_path):
+                with open(meta_path, 'r') as f:
+                    model_meta = json.load(f)
+                validation_spearman = model_meta.get('validation_spearman', 0.0)
+                if validation_spearman < 0.02:
+                    logger.error(f"🛑 PANIC SWITCH: Validation Spearman ({validation_spearman:.4f}) < 0.02. Aborting rebalance.")
+                    send_telegram_message(f"🛑 PANIC SWITCH: Validation Spearman ({validation_spearman:.4f}) < 0.02. Trading suspended for {timeframe}.")
+                    
+                    # Update state so we don't spam the API/Telegram
+                    config["last_rebalance_ts"] = int(time.time())
+                    s3.upload_json("live_config.json", config)
+                    return {'statusCode': 400, 'body': 'Trading suspended due to low model conviction'}
+
             risk.clean_global_zombies(portfolio, open_orders)
 
             logger.info(f"🌐 THE LIVE SNAPSHOT ({timeframe})")
@@ -427,24 +444,6 @@ def executor_handler(event, context):
                     mega_df[col] = mega_df[col].fillna(col_mean if pd.notna(col_mean) else 0.0)
                     mega_df[f'rank_{col}'] = mega_df[col].rank(pct=True)
 
-            s3 = S3Interface(AWS_BUCKET)
-            
-            # ─── THE PANIC SWITCH ───
-            # Layer 2 Defense: Check model meta before downloading models
-            meta_path = f'/tmp/cross_sectional_lgbm_{timeframe}_meta.json'
-            if s3.download_file(f'models/cross_sectional_lgbm_{timeframe}_meta.json', meta_path):
-                with open(meta_path, 'r') as f:
-                    model_meta = json.load(f)
-                validation_spearman = model_meta.get('validation_spearman', 0.0)
-                if validation_spearman < 0.02:
-                    logger.error(f"🛑 PANIC SWITCH: Validation Spearman ({validation_spearman:.4f}) < 0.02. Aborting trades.")
-                    send_telegram_message(f"🛑 PANIC SWITCH: Validation Spearman ({validation_spearman:.4f}) < 0.02. Trading suspended for {timeframe}.")
-                    
-                    # Update state so we don't spam the API/Telegram
-                    config["last_rebalance_ts"] = int(time.time())
-                    s3.upload_json("live_config.json", config)
-                    return {'statusCode': 400, 'body': 'Trading suspended due to low model conviction'}
-            
             lgb_path = f'/tmp/cross_sectional_lgbm_{timeframe}.txt'
             xgb_path = f'/tmp/cross_sectional_xgboost_{timeframe}.json'
             ridge_path = f'/tmp/cross_sectional_ridge_{timeframe}.joblib'
