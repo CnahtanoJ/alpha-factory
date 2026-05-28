@@ -499,6 +499,8 @@ class RiskEngine:
             {"trigger": {"isMarket": True, "triggerPx": sl_px, "tpsl": "sl"}},
             reduce_only=True
         )
+        self.memory.set(coin, 'sl_px', sl_px)
+        self.memory.set(coin, 'is_long', is_buy_pos)
         send_telegram_message(f"🛑 INITIAL SL ({sl_mult}x ATR): {total_sz} @ {sl_px}")
 
     def sync_trailing_stop(self, coin, current_atr_pct, portfolio, open_orders):        
@@ -508,11 +510,25 @@ class RiskEngine:
         if coin not in portfolio:
             if self.memory.get(coin, 'entry_time', default=0) > 0: 
                 streak = self.memory.get('GLOBAL', 'consecutive_losses', default=0)
-                # Since we don't have a fixed TP anymore, we assume it's a loss if it hit SL,
-                # UNLESS the exit price was higher than entry. For now, we assume loss to be safe.
-                streak += 1
-                self.memory.set('GLOBAL', 'consecutive_losses', streak)
-                logger.info(f"📉 {coin} position closed. Consecutive losses metric: {streak}")
+                entry_px = self.memory.get(coin, 'last_known_entry', default=0)
+                sl_px = self.memory.get(coin, 'sl_px', default=0)
+                is_long = self.memory.get(coin, 'is_long', default=True)
+                
+                is_profitable = False
+                if entry_px > 0 and sl_px > 0:
+                    if is_long:
+                        is_profitable = (sl_px > entry_px)
+                    else:
+                        is_profitable = (sl_px < entry_px)
+                
+                if is_profitable:
+                    self.memory.set('GLOBAL', 'consecutive_losses', 0)
+                    streak = 0
+                    logger.info(f"📈 {coin} trailing stop hit in profit/BE ({entry_px} -> {sl_px}). Streak reset.")
+                else:
+                    streak += 1
+                    self.memory.set('GLOBAL', 'consecutive_losses', streak)
+                    logger.info(f"📉 {coin} trailing stop hit at a loss ({entry_px} -> {sl_px}). Consecutive losses: {streak}")
                 
                 logger.info(f"🔔 DETECTED EXIT: {coin} position is gone.")
                 send_telegram_message(f"🔔 NOTIFICATION: {coin} Position Closed. Current Streak Metric: {streak}")
@@ -540,6 +556,9 @@ class RiskEngine:
         curr_px = float(self.info.all_mids()[coin])
         is_long = pos_size > 0
 
+        # Sync states in memory
+        self.memory.set(coin, 'is_long', is_long)
+
         # Find existing SL
         existing_sl = next((
             o for o in open_orders 
@@ -552,6 +571,10 @@ class RiskEngine:
             logger.warning(f"😱 NAKED POSITION: {coin} missing SL. Resetting Orders!")
             self.sync_unified_orders(coin, current_atr_pct, portfolio)
             return
+
+        # Update stored SL price from existing SL if not set
+        if existing_sl and self.memory.get(coin, 'sl_px', default=0) == 0:
+            self.memory.set(coin, 'sl_px', float(existing_sl['triggerPx']))
 
         # 1. ⚠️ SOFT STOP WATCHDOG
         soft_dist = 0.01 
@@ -595,6 +618,7 @@ class RiskEngine:
                 if res['status'] == 'ok':
                     logger.info("✅ Trailing SL Move Confirmed.")
                     send_telegram_message(f"📈 TRAILING STOP: {coin} SL raised to {safe_new_sl} (Current Price: {curr_px})")
+                    self.memory.set(coin, 'sl_px', safe_new_sl)
                 else:
                     err_msg = res.get('response', {}).get('data', 'Unknown Error')
                     logger.error(f"❌ SL MOVE REJECTED: {err_msg}")

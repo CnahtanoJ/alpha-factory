@@ -18,7 +18,7 @@ from data_pipeline.database import DB_PATH
 # --- CANONICAL FEATURE SETS (Single Source of Truth) ---
 RAW_CONTINUOUS = [
     'rsi', 'macd', 'volatility_20', 'basis_pct', 'oi_usd', 'funding_rate', 
-    'sum_toptrader_long_short_ratio', 'corr_to_index',
+    'sum_toptrader_long_short_ratio', 'corr_to_index', 'taker_buy_sell_ratio',
     'oi_delta_4', 'funding_delta_4', 'sum_toptrader_ls_delta_4',
     'distance_from_ema_50', 'volatility_zscore', 
     'volume_zscore', 'relative_strength_btc',
@@ -28,7 +28,9 @@ RAW_CONTINUOUS = [
     'range_expansion', 'net_taker_volume_zscore',
     # NEW PHASE 2 DELTA FEATURES
     'rsi_delta_4', 'macd_delta_4', 'volatility_delta_4', 'volume_delta_4',
-    'oi_change_pct_12', 'funding_acceleration'
+    'oi_change_pct_12', 'funding_acceleration',
+    # NEW PHASE 6 TABULAR LAGS
+    'ret_1', 'ret_2', 'ret_3', 'mom_accel_1_3'
 ]
 
 FULL_CONTINUOUS = [f'rank_{f}' for f in RAW_CONTINUOUS]
@@ -36,11 +38,17 @@ FULL_CONTINUOUS = [f'rank_{f}' for f in RAW_CONTINUOUS]
 PRUNED_CONTINUOUS = [
     'rank_rsi', 'rank_macd', 'rank_volatility_20', 'rank_basis_pct', 'rank_oi_usd', 
     'rank_funding_rate', 'rank_sum_toptrader_long_short_ratio', 'rank_corr_to_index',
+    'rank_taker_buy_sell_ratio',
     'rank_oi_delta_4', 'rank_distance_from_ema_50', 'rank_volatility_zscore', 
     'rank_volume_zscore', 'rank_relative_strength_btc',
     'rank_cvd_slope_5', 'rank_price_cvd_divergence', 'rank_sentiment_divergence',
     'rank_trend_convergence', 'rank_bbw_squeeze', 'rank_funding_basis_divergence',
-    'rank_vol_volatility_ratio', 'rank_market_beta', 'rank_rsi_divergence', 'rank_vpt_slope'
+    'rank_vol_volatility_ratio', 'rank_market_beta', 'rank_rsi_divergence', 'rank_vpt_slope',
+    'rank_range_expansion', 'rank_net_taker_volume_zscore',
+    'rank_funding_delta_4', 'rank_sum_toptrader_ls_delta_4',
+    'rank_rsi_delta_4', 'rank_macd_delta_4', 'rank_volatility_delta_4', 'rank_volume_delta_4',
+    'rank_oi_change_pct_12', 'rank_funding_acceleration',
+    'rank_ret_1', 'rank_ret_2', 'rank_ret_3', 'rank_mom_accel_1_3'
 ]
 
 FULL_TIME = ['hour_sin', 'hour_cos', 'day_sin', 'day_cos']
@@ -106,7 +114,7 @@ def fetch_and_merge_symbol_data(symbol, conn, timeframe='15m'):
         df['index_close'] = df['close'] # Fallback
 
     # 3. Fetch Symbol Metrics (C-4 FIX: fetch sum_open_interest_value which is already in USD)
-    metrics_df = pd.read_sql_query("SELECT timestamp as met_ts, sum_open_interest, sum_open_interest_value, sum_toptrader_long_short_ratio, sum_long_short_ratio FROM symbol_metrics WHERE symbol = ? ORDER BY timestamp", conn, params=(symbol,))
+    metrics_df = pd.read_sql_query("SELECT timestamp as met_ts, sum_open_interest, sum_open_interest_value, sum_toptrader_long_short_ratio, sum_long_short_ratio, sum_taker_long_short_vol_ratio FROM symbol_metrics WHERE symbol = ? ORDER BY timestamp", conn, params=(symbol,))
     if not metrics_df.empty:
         metrics_df['met_ts'] = pd.to_datetime(metrics_df['met_ts'], unit='ms').dt.floor('s')
         df = pd.merge_asof(df, metrics_df, left_on='timestamp', right_on='met_ts', direction='backward', tolerance=pd.Timedelta(hours=2))
@@ -119,7 +127,7 @@ def fetch_and_merge_symbol_data(symbol, conn, timeframe='15m'):
     fund_df = pd.read_sql_query("SELECT calc_time, last_funding_rate FROM funding_rate WHERE symbol = ? ORDER BY calc_time", conn, params=(symbol,))
     if not fund_df.empty:
         fund_df['calc_time'] = pd.to_datetime(fund_df['calc_time'], unit='ms').dt.floor('s')
-        df = pd.merge_asof(df, fund_df, left_on='timestamp', right_on='calc_time', direction='backward', tolerance=pd.Timedelta(hours=16))
+        df = pd.merge_asof(df, fund_df, left_on='timestamp', right_on='calc_time', direction='backward', tolerance=pd.Timedelta(hours=8))
     else:
         df['last_funding_rate'] = np.nan
 
@@ -138,7 +146,11 @@ def fetch_and_merge_symbol_data(symbol, conn, timeframe='15m'):
 
     # C-3 FIX: Bounded forward fill — propagate lower-frequency data (metrics/funding)
     # within a safe window, but never across unfillable gaps
-    fill_cols = ['index_close', 'sum_open_interest', 'sum_open_interest_value', 'sum_toptrader_long_short_ratio', 'last_funding_rate']
+    fill_cols = [
+        'index_close', 'sum_open_interest', 'sum_open_interest_value', 
+        'sum_toptrader_long_short_ratio', 'sum_long_short_ratio', 
+        'sum_taker_long_short_vol_ratio', 'last_funding_rate'
+    ]
     for col in fill_cols:
         if col in df.columns:
             df[col] = df[col].ffill(limit=8)  # Max 8 periods (2h for 15m candles)
@@ -299,6 +311,12 @@ def add_time_series_features(df, btc_df=None):
     df['volume_delta_4'] = df['volume'].pct_change(4)
     df['oi_change_pct_12'] = df['oi_usd'].pct_change(12)
     df['funding_acceleration'] = df['funding_delta_4'].diff(1)
+    
+    # --- NEW PHASE 6 TABULAR LAGS & MOMENTUM ---
+    df['ret_1'] = df['close'].pct_change(1)
+    df['ret_2'] = df['close'].pct_change(2)
+    df['ret_3'] = df['close'].pct_change(3)
+    df['mom_accel_1_3'] = df['ret_1'] - df['ret_3']
     
     # Forward Return (Target Calculation)
     # Dynamic horizon based on timeframe
@@ -528,11 +546,24 @@ def build_mega_dataframe(timeframe='15m'):
     # Clip extreme 1%/99% outliers for critical columns to protect the linear model
     # Optimized for speed (uses Cython-backed quantile transform)
     print("Applying Outlier Winsorization (1%/99%)...")
-    critical_cols = ['fwd_return', 'funding_rate', 'volume_zscore', 'volatility_zscore']
+    critical_cols = ['funding_rate', 'volume_zscore', 'volatility_zscore', 'ret_1', 'ret_2', 'ret_3', 'mom_accel_1_3']
     for col in critical_cols:
         if col in mega_df.columns:
-            q_01 = mega_df.groupby('timestamp')[col].transform('quantile', 0.01)
-            q_99 = mega_df.groupby('timestamp')[col].transform('quantile', 0.99)
+            # Prevent unstable quantile estimates for small cohorts (L-2 Fix)
+            counts = mega_df.groupby('timestamp')[col].transform('count')
+            
+            # Per-timestamp quantiles
+            q_01_ts = mega_df.groupby('timestamp')[col].transform('quantile', 0.01)
+            q_99_ts = mega_df.groupby('timestamp')[col].transform('quantile', 0.99)
+            
+            # Global fallback quantiles
+            q_01_glob = mega_df[col].quantile(0.01)
+            q_99_glob = mega_df[col].quantile(0.99)
+            
+            # Use per-timestamp if >= 10 symbols, else global
+            q_01 = np.where(counts >= 10, q_01_ts, q_01_glob)
+            q_99 = np.where(counts >= 10, q_99_ts, q_99_glob)
+            
             mega_df[col] = mega_df[col].clip(lower=q_01, upper=q_99)
 
     # PHASE 4: Macro Conviction Injection (4h → 15m/1h)

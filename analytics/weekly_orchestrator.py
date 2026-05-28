@@ -242,7 +242,14 @@ def run_weekly_cycle(
                 with open(meta_path, 'r') as f:
                     prev_meta = json.load(f)
             
-            logger.info(f"🎯 OOS Spearman Correlation: {oos_spearman:.4f} (Validation was {prev_meta.get('validation_spearman_correlation', 0):.4f})")
+            val_spearman = prev_meta.get('validation_spearman', prev_meta.get('validation_spearman_correlation', 0))
+            logger.info(f"🎯 OOS Spearman Correlation: {oos_spearman:.4f} (Validation was {val_spearman:.4f})")
+            
+            # Decay Monitoring (M-5 Fix)
+            if oos_spearman < 0.01:
+                logger.warning(f"🚨 DECAY ALERT: OOS Spearman ({oos_spearman:.4f}) has dropped below the degradation threshold (0.01) on {timeframe}! Performance decay detected!")
+            else:
+                logger.info(f"✅ DECAY MONITORING: OOS Spearman ({oos_spearman:.4f}) is healthy (>= 0.01) on {timeframe}.")
 
             fwd_bars = get_fwd_return_bars(timeframe)
             simulation_results = simulate_portfolio(
@@ -250,8 +257,11 @@ def run_weekly_cycle(
                 top_n=top_n, bottom_n=bottom_n,
                 rebalance_freq=fwd_bars, 
                 timeframe=timeframe,
-                weighting_mode='equal'
+                weighting_mode='hrp'
             )
+            
+            # Store OOS spearman in the results for reporting
+            simulation_results['oos_spearman'] = oos_spearman
 
             from backtester.dry_run_simulator import format_simulation_summary
             logger.info(f"\n{format_simulation_summary(simulation_results)}")

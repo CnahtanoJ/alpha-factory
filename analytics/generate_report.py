@@ -29,22 +29,23 @@ def build_report_section(timeframe: str, cycle_results: dict) -> str:
     # --- Section 1: Model Health ---
     md += "### 📊 Model Training Summary\n"
     rmse = model_meta.get('validation_rmse', 'N/A')
-    spearman = model_meta.get('validation_spearman', 'N/A')
-    p_val = model_meta.get('spearman_p_value', 'N/A')
+    oos_spearman = sim.get('oos_spearman', 'N/A') if sim else 'N/A'
 
     def fmt(v):
         return f"{v:.4f}" if isinstance(v, (int, float)) else str(v)
 
-    if isinstance(spearman, float):
-        if spearman > 0.10:
+    if isinstance(oos_spearman, float):
+        if oos_spearman > 0.05:
             health = "🟢 Strong"
-        elif spearman > 0.05:
+        elif oos_spearman > 0.03:
             health = "🟡 Moderate"
+        elif oos_spearman > 0.02:
+            health = "🟠 Weak"
         else:
-            health = "🔴 Weak"
-        md += f"> Model Health: {health} | Spearman ρ = **{spearman:.4f}** (p={fmt(p_val)}) | RMSE = {fmt(rmse)}\n\n"
+            health = "🔴 No Signal"
+        md += f"> Model Health: {health} | OOS Spearman ρ = **{oos_spearman:.4f}** | RMSE = {fmt(rmse)}\n\n"
     else:
-        md += f"> Model Health: Unknown | RMSE = {rmse} | Spearman = {spearman}\n\n"
+        md += f"> Model Health: Unknown | RMSE = {fmt(rmse)} | OOS Spearman = {oos_spearman}\n\n"
 
     # --- Section 2: OOS Simulation Results ---
     md += "### 🔬 Out-of-Sample Dry Run\n"
@@ -54,7 +55,8 @@ def build_report_section(timeframe: str, cycle_results: dict) -> str:
         md += "| Metric | Value |\n"
         md += "| :--- | :--- |\n"
         md += f"| **Total Return** | {sim['total_return']:+.2%} |\n"
-        md += f"| **Sharpe Ratio** | {sim['sharpe']:.2f} |\n"
+        md += f"| **Raw Sharpe** | {sim['sharpe']:.2f} |\n"
+        md += f"| **Ann. Sharpe** | {sim.get('annualized_sharpe', 0.0):.2f} |\n"
         md += f"| **Profit Factor** | {sim['profit_factor']:.2f} |\n"
         md += f"| **Win Rate** | {sim['win_rate']:.1%} |\n"
         md += f"| **Max Drawdown** | {sim['max_drawdown']:.2%} |\n"
@@ -128,9 +130,9 @@ def generate_report(multi_results: dict) -> str:
         sim = res.get('simulation_results')
         meta = res.get('model_meta', {})
         ret = f"{sim['total_return']:+.2%}" if sim else "N/A"
-        sha = f"{sim['sharpe']:.2f}" if sim else "N/A"
+        sha = f"{sim['sharpe']:.2f} ({sim.get('annualized_sharpe', 0.0):.2f} Ann.)" if sim else "N/A"
         win = f"{sim['win_rate']:.1%}" if sim else "N/A"
-        rho = f"{meta.get('validation_spearman', 0):.4f}"
+        rho = f"{sim.get('oos_spearman', 0):.4f}" if sim else "N/A"
         md += f"| **{tf}** | {ret} | {sha} | {win} | {rho} |\n"
     
     md += "\n"

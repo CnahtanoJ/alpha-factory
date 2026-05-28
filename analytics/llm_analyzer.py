@@ -150,7 +150,7 @@ def build_llm_context(
     # Section 4: Model Metadata
     lines.append("\n## 5. MODEL TRAINING METADATA")
     lines.append(f"  Validation RMSE:       {model_meta.get('validation_rmse', 'N/A')}")
-    lines.append(f"  Spearman Correlation:  {model_meta.get('validation_spearman_correlation', 'N/A')}")
+    lines.append(f"  Spearman Correlation:  {model_meta.get('validation_spearman', 'N/A')}")
     lines.append(f"  Spearman p-value:      {model_meta.get('spearman_p_value', 'N/A')}")
 
     return "\n".join(lines)

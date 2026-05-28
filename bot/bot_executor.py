@@ -30,17 +30,18 @@ from data_pipeline.hyperliquid_sync import (
     get_bulk_latest_candles
 )
 from data_pipeline.database import get_connection
-from data_pipeline.binance_live import get_bulk_binance_sentiment
+from data_pipeline.binance_live import get_bulk_binance_derivatives
+from analytics.portfolio_optimizer import compute_hrp_weights
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
 class LiveInferenceEngine:
-    def __init__(self, info, conn=None, live_sentiment=None):
+    def __init__(self, info, conn=None, live_derivatives=None):
         self.info = info
         self.conn = conn
-        self.live_sentiment = live_sentiment
+        self.live_derivatives = live_derivatives
 
     def build_live_features(self, symbol, candles, ctx, index_df=None, htf_candles=None):
         if not candles: return None
@@ -68,8 +69,73 @@ class LiveInferenceEngine:
             except Exception as e:
                 logger.warning(f"⚠️ Could not fetch historical index data for {symbol}: {e}")
 
-        # Live row always uses the most recent oracle price from Hyperliquid context
-        df['live_index_close'] = float(ctx.get('oraclePx', df['close'].iloc[-1]))
+            # Fetch historical symbol metrics and funding rates from database if available
+            try:
+                # 1. Fetch Symbol Metrics
+                met_q = """
+                    SELECT timestamp as met_ts, sum_open_interest, sum_open_interest_value, 
+                           sum_toptrader_long_short_ratio, sum_long_short_ratio, sum_taker_long_short_vol_ratio 
+                    FROM symbol_metrics 
+                    WHERE symbol = ? 
+                    ORDER BY timestamp DESC 
+                    LIMIT 100
+                """
+                met_df = pd.read_sql_query(met_q, self.conn, params=(symbol,))
+                if not met_df.empty:
+                    met_df['met_ts'] = pd.to_datetime(met_df['met_ts'], unit='ms').dt.floor('s')
+                    df = pd.merge_asof(df, met_df, left_on='timestamp', right_on='met_ts', direction='backward')
+            except Exception as e:
+                logger.warning(f"⚠️ Could not fetch historical metrics for {symbol}: {e}")
+
+            try:
+                # 2. Fetch Funding Rate
+                fund_q = """
+                    SELECT calc_time, last_funding_rate 
+                    FROM funding_rate 
+                    WHERE symbol = ? 
+                    ORDER BY calc_time DESC 
+                    LIMIT 100
+                """
+                fund_df = pd.read_sql_query(fund_q, self.conn, params=(symbol,))
+                if not fund_df.empty:
+                    fund_df['calc_time'] = pd.to_datetime(fund_df['calc_time'], unit='ms').dt.floor('s')
+                    df = pd.merge_asof(df, fund_df, left_on='timestamp', right_on='calc_time', direction='backward')
+            except Exception as e:
+                logger.warning(f"⚠️ Could not fetch historical funding for {symbol}: {e}")
+
+        # Forward fill the historical columns
+        fill_cols = [
+            'index_close', 'sum_open_interest', 'sum_open_interest_value', 
+            'sum_toptrader_long_short_ratio', 'sum_long_short_ratio', 
+            'sum_taker_long_short_vol_ratio', 'last_funding_rate'
+        ]
+        for col in fill_cols:
+            if col in df.columns:
+                df[col] = df[col].ffill(limit=8)
+
+        # Ensure all core and feature columns exist in the DataFrame
+        for col in [
+            'oi_usd', 'funding_rate', 'last_funding_rate', 'sum_toptrader_long_short_ratio', 
+            'sum_long_short_ratio', 'sum_taker_long_short_vol_ratio', 'sum_open_interest'
+        ]:
+            if col not in df.columns:
+                df[col] = np.nan
+
+        # Map historical columns if available
+        if 'sum_open_interest_value' in df.columns:
+            df['oi_usd'] = df['sum_open_interest_value'].fillna(df['sum_open_interest'] * df['close'])
+        else:
+            df['oi_usd'] = df['sum_open_interest'] * df['close']
+            
+        if 'last_funding_rate' in df.columns:
+            df['funding_rate'] = df['last_funding_rate']
+
+        # Live data lookup from Binance
+        live_data = self.live_derivatives.get(symbol, {}) if self.live_derivatives else {}
+
+        # Live row always uses the most recent index price from Binance, fallback to Hyperliquid oracle price
+        binance_idx = float(live_data.get('index_close', 0.0))
+        df['live_index_close'] = binance_idx if binance_idx > 0 else float(ctx.get('oraclePx', df['close'].iloc[-1]))
         
         # If we have historical index data, use it for all but the last row
         if 'index_close' in df.columns:
@@ -79,34 +145,40 @@ class LiveInferenceEngine:
         else:
             df['final_index_close'] = df['live_index_close']
 
-        df['sum_open_interest'] = ctx.get('openInterest', 0)
-        df['last_funding_rate'] = ctx.get('funding', 0)
+        # Overwrite last row (live snapshot) with Binance/HL live data
+        binance_oi = float(live_data.get('oi_usd', 0.0))
+        live_oi = binance_oi if binance_oi > 0 else float(ctx.get('openInterest', 0)) * float(ctx.get('oraclePx', 0))
+        df.loc[df.index[-1], 'oi_usd'] = live_oi
         
-        # ── Derivative Fuel (P0-2 FIX: use real data, not zeros) ──
-        # The training model now uses raw OI in USD, so we match it exactly.
-        oi_value = float(ctx.get('openInterest', 0)) * float(ctx.get('oraclePx', 0))
-        df['oi_usd'] = oi_value  # Raw OI in USD; will be ranked across all assets
+        binance_funding = live_data.get('funding_rate', None)
+        live_funding = float(binance_funding if binance_funding is not None else ctx.get('funding', 0))
+        df.loc[df.index[-1], 'funding_rate'] = live_funding
+        df.loc[df.index[-1], 'last_funding_rate'] = live_funding
 
-        # Funding rate: training model now uses raw absolute funding rate.
-        df['funding_rate'] = float(ctx.get('funding', 0))
+        df.loc[df.index[-1], 'sum_open_interest'] = ctx.get('openInterest', 0)
 
-        # --- LIVE SENTIMENT INJECTION ---
-        # Map Binance dict keys to canonical model feature names
-        top_trader = np.nan
-        global_retail = np.nan
+        # --- LIVE SENTIMENT & TAKER RATIO INJECTION ---
+        top_trader = live_data.get('top_long_short', np.nan)
+        global_retail = live_data.get('global_long_short', np.nan)
+        taker_ratio = live_data.get('taker_buy_sell_ratio', np.nan)
         
-        if self.live_sentiment and symbol in self.live_sentiment:
-            # Sync with Binance API dict keys, ensuring we get floats or NaNs, not None
-            top_trader = self.live_sentiment[symbol].get('top_trader_ratio')
-            global_retail = self.live_sentiment[symbol].get('long_short_ratio')
-        
-        # Ensure we have floats/NaNs to avoid NoneType errors during diff()
-        df['sum_toptrader_long_short_ratio'] = pd.to_numeric(top_trader, errors='coerce')
-        df['sum_long_short_ratio'] = pd.to_numeric(global_retail, errors='coerce')
+        # Map them for the live row
+        if pd.notna(top_trader):
+            df.loc[df.index[-1], 'sum_toptrader_long_short_ratio'] = pd.to_numeric(top_trader, errors='coerce')
+        if pd.notna(global_retail):
+            df.loc[df.index[-1], 'sum_long_short_ratio'] = pd.to_numeric(global_retail, errors='coerce')
+        if pd.notna(taker_ratio):
+            df.loc[df.index[-1], 'sum_taker_long_short_vol_ratio'] = pd.to_numeric(taker_ratio, errors='coerce')
+            
+        # Ensure taker_buy_sell_ratio is populated
+        df['taker_buy_sell_ratio'] = df['sum_taker_long_short_vol_ratio']
         
         # Fallback to neutral cross-sectional mean (later in the pipeline)
-        if pd.notna(top_trader) and pd.notna(global_retail):
-            df['sentiment_divergence'] = top_trader - global_retail
+        # Using the last row's values to compute sentiment divergence
+        last_top = df['sum_toptrader_long_short_ratio'].iloc[-1]
+        last_global = df['sum_long_short_ratio'].iloc[-1]
+        if pd.notna(last_top) and pd.notna(last_global):
+            df['sentiment_divergence'] = df['sum_toptrader_long_short_ratio'] - df['sum_long_short_ratio']
         else:
             df['sentiment_divergence'] = 0.0
 
@@ -237,6 +309,12 @@ class LiveInferenceEngine:
         df['oi_change_pct_12'] = df['oi_usd'].pct_change(12)
         df['funding_acceleration'] = df['funding_delta_4'].diff(1)
         
+        # --- NEW PHASE 6 TABULAR LAGS & MOMENTUM ---
+        df['ret_1'] = df['close'].pct_change(1)
+        df['ret_2'] = df['close'].pct_change(2)
+        df['ret_3'] = df['close'].pct_change(3)
+        df['mom_accel_1_3'] = df['ret_1'] - df['ret_3']
+        
         # Return only the latest row, but keep features needed for ranking and regime
         return df.iloc[-1:] 
 
@@ -251,7 +329,7 @@ def executor_handler(event, context):
     try:
         s3 = S3Interface(AWS_BUCKET)
         config = s3.download_json("live_config.json")
-        timeframe = config.get("selected_timeframe", "15m")
+        timeframe = config.get("active_timeframe", "15m")
         last_rebalance = config.get("last_rebalance_ts", 0)
     except Exception as e:
         logger.warning(f"⚠️ Could not load live_config.json: {e}. Defaulting to 15m.")
@@ -349,15 +427,15 @@ def executor_handler(event, context):
             top_50_symbols = get_hl_top_by_volume(50)
             live_ctx = get_live_meta_ctx()
             
-            logger.info(f"🐳 Fetching Live Sentiment from Binance ({timeframe})...")
-            live_sentiment = get_bulk_binance_sentiment(top_50_symbols, period=timeframe)
+            logger.info(f"🐳 Fetching Live Derivatives from Binance ({timeframe})...")
+            live_derivatives = get_bulk_binance_derivatives(top_50_symbols, period=timeframe)
             
             try:
                 db_conn = get_connection()
             except Exception as e:
                 logger.warning(f"⚠️ Could not connect to local database: {e}. Proceeding without historical DB features.")
                 db_conn = None
-            engine = LiveInferenceEngine(info, conn=db_conn, live_sentiment=live_sentiment)
+            engine = LiveInferenceEngine(info, conn=db_conn, live_derivatives=live_derivatives)
             live_rows = []
         
             logger.info(f"🧬 Generating Live Features ({timeframe})...")
@@ -464,9 +542,7 @@ def executor_handler(event, context):
                     feature_cols, time_features = get_feature_names(timeframe)
                     X_live = mega_df[feature_cols + time_features]
                     mega_df['predicted_rank'] = (0.4 * model_lgb.predict(X_live)) + (0.4 * model_xgb.predict(X_live)) + (0.2 * model_ridge.predict(X_live))
-                    if 'macro_conviction_4h' in mega_df.columns:
-                        conflict_mask = (np.sign(mega_df['macro_conviction_4h']) != np.sign(mega_df['predicted_rank'])) & (abs(mega_df['macro_conviction_4h']) > 0.5)
-                        mega_df.loc[conflict_mask, 'predicted_rank'] *= 0.7
+                    # Macro conviction conflict dampening removed (P2 H-3: dead feature adds noise)
                     ml_success = True
                 except Exception as e:
                     logger.error(f"⚠️ Ensemble Inference Failed: {e}")
@@ -495,9 +571,38 @@ def executor_handler(event, context):
             portfolio = risk.parse_portfolio(info.user_state(ADDR), all_mids)
             target_rows = mega_df[mega_df['symbol'].isin(target_basket)].copy()
             if not target_rows.empty:
-                target_rows['inv_vol'] = 1.0 / (target_rows['atr_pct'].fillna(0.001).clip(lower=0.001))
-                total_target_usd = float(user_state.get('marginSummary', {}).get('accountValue', 0)) * 0.90
-                symbol_to_usd = dict(zip(target_rows['symbol'], (target_rows['inv_vol'] / target_rows['inv_vol'].sum()) * total_target_usd))
+                # Build historical returns matrix for HRP
+                hist_returns = {}
+                for coin in target_basket:
+                    coin_candles = bulk_candles.get(coin, [])
+                    if coin_candles:
+                        closes = pd.Series([float(c['close']) for c in coin_candles])
+                        hist_returns[coin] = closes.pct_change()
+                
+                if hist_returns:
+                    returns_df = pd.DataFrame(hist_returns).tail(100)
+                    alphas = target_rows.set_index('symbol')['predicted_rank']
+                    
+                    long_symbols = [c for c in target_basket if c in target_longs]
+                    short_symbols = [c for c in target_basket if c in target_shorts]
+                    
+                    long_w_dict = compute_hrp_weights(returns_df, long_symbols, alphas=alphas)
+                    short_w_dict = compute_hrp_weights(returns_df, short_symbols, alphas=alphas)
+                    
+                    # 50/50 Dollar Neutral Allocation
+                    total_target_usd = float(user_state.get('marginSummary', {}).get('accountValue', 0)) * 0.90
+                    symbol_to_usd = {}
+                    for sym, w in long_w_dict.items():
+                        symbol_to_usd[sym] = w * (total_target_usd / 2.0)
+                    for sym, w in short_w_dict.items():
+                        symbol_to_usd[sym] = w * (total_target_usd / 2.0)
+                else:
+                    # Fallback to inverse vol if candles failed
+                    logger.warning("⚠️ Could not build historical returns for HRP. Falling back to inverse ATR volatility.")
+                    target_rows['inv_vol'] = 1.0 / (target_rows['atr_pct'].fillna(0.001).clip(lower=0.001))
+                    total_target_usd = float(user_state.get('marginSummary', {}).get('accountValue', 0)) * 0.90
+                    symbol_to_usd = dict(zip(target_rows['symbol'], (target_rows['inv_vol'] / target_rows['inv_vol'].sum()) * total_target_usd))
+                
                 for target_coin in target_basket:
                     row = mega_df[mega_df['symbol'] == target_coin].iloc[0]
                     atr_pct = float(row['atr_pct'])

@@ -173,6 +173,9 @@ This triggers the **God Mode Pipeline** (fully automated):
 3. **Universal Gap Patcher**: `universal_gap_patcher.py` scans for temporal gaps, fetches daily ZIPs to fill them, and permanently blacklists confirmed empty archives in the `unfillable_gaps` table.
 4. **Data Auditor**: Prints a final health report card (Grade A+ → F) for every partition, forgiving unfillable gaps.
 
+> [!NOTE]
+> **Survivorship Bias & Symbol Universe (M-4)**: The weekly cycle queries all historically ingested symbols present in `ohlcv` to build the training set. This design mitigates survivorship bias by ensuring that historically delisted or inactive coins remain part of the training data as long as their history remains in the database.
+
 ### Ingestion Sources
 
 | Source | File | Purpose |
@@ -219,7 +222,7 @@ A **LightGBM regression model** trained on cross-sectionally ranked features to 
 
 ### Training Pipeline
 1. **Mega-DataFrame Construction**: Fetches all symbols from the database. For each symbol, merges `ohlcv`, `index_ohlcv`, `symbol_metrics`, and `funding_rate` via `merge_asof`.
-2. **Feature Engineering**: Computes per-symbol indicators (RSI, MACD, volatility), derivative fuel (basis, OI z-score, funding delta), market correlation (`corr_to_index`), cyclic time features (`hour_sin/cos`, `day_sin/cos`), and strategy signals (12 families).
+2. **Feature Engineering**: Computes per-symbol indicators (RSI, MACD, volatility), derivative fuel (basis, OI z-score, funding delta, whale vs. retail sentiment divergence), market correlation (`corr_to_index`), cyclic time features (`hour_sin/cos`, `day_sin/cos`), and dynamic momentum and volatility delta features.
 3. **Cross-Sectional Ranking**: At each timestamp, all continuous features are ranked across symbols using percentile ranks (`rank(pct=True)`).
 4. **Walk-Forward Split**: 85% train / 15% validation (chronological, no leakage).
 5. **LightGBM Training**: GBDT regression with early stopping on validation RMSE.
@@ -229,9 +232,8 @@ A **LightGBM regression model** trained on cross-sectionally ranked features to 
 
 | Category | Features |
 |:--|:--|
-| **Ranked Continuous** | `rank_rsi`, `rank_macd`, `rank_volatility_20`, `rank_basis_pct`, `rank_oi_usd`, `rank_funding_rate`, `rank_sum_toptrader_long_short_ratio`, `rank_corr_to_index` |
+| **Ranked Continuous** | `rank_rsi`, `rank_macd`, `rank_volatility_20`, `rank_basis_pct`, `rank_oi_usd`, `rank_funding_rate`, `rank_sum_toptrader_long_short_ratio`, `rank_corr_to_index`, `rank_oi_delta_4`, `rank_funding_delta_4`, `rank_sum_toptrader_ls_delta_4`, `rank_volatility_zscore`, `rank_volume_zscore`, `rank_relative_strength_btc`, `rank_cvd_slope_5`, `rank_price_cvd_divergence`, `rank_sentiment_divergence`, `rank_trend_convergence`, `rank_bbw_squeeze`, `rank_funding_basis_divergence`, `rank_vol_volatility_ratio`, `rank_market_beta`, `rank_rsi_divergence`, `rank_vpt_slope` |
 | **Time-Aware** | `hour_sin`, `hour_cos`, `day_sin`, `day_cos` |
-| **Strategy Signals** | `sig_SimpleBreakout`, `sig_EMACrossover`, `sig_MACDStrategy`, ... (12 total) |
 
 ### Model Persistence
 - Model: `analytics/models/cross_sectional_lgbm.txt` (LightGBM native) → also uploaded to S3
@@ -245,10 +247,10 @@ A **LightGBM regression model** trained on cross-sectionally ranked features to 
 
 ### Sequence (strict order)
 1. **Load Previous Model** — The model trained LAST week.
-2. **OOS Simulation** — Use last week's model to predict THIS week's data. Simulate a Top 10 Long / Bottom 10 Short portfolio.
+2. **OOS Simulation** — Use last week's model to predict THIS week's data. Simulate a Top 5 Long / Bottom 5 Short portfolio.
 3. **Train New Model** — Retrain LightGBM on the full updated dataset for the upcoming week.
 4. **Feature Importance** — Extract gain-based feature importance from the new model.
-5. **Per-Asset Attribution** — For Top 10 and Bottom 10 assets, identify extreme features that drove their ranking.
+5. **Per-Asset Attribution** — For Top 5 and Bottom 5 assets, identify extreme features that drove their ranking.
 
 ### Simulation Mechanics (`dry_run_simulator.py`)
 - **Vectorized**: No event-driven loops. Pure pandas operations.
@@ -274,8 +276,8 @@ A **LightGBM regression model** trained on cross-sectionally ranked features to 
 ### Report Sections
 1. **Model Training Summary**: Spearman ρ, RMSE, health grade (🟢/🟡/🔴).
 2. **OOS Dry Run Results**: Sharpe, PF, Win Rate, Max Drawdown.
-3. **Top 10 Longs**: Assets with highest predicted rank + key feature drivers.
-4. **Bottom 10 Shorts**: Assets with lowest predicted rank + key feature drivers.
+3. **Top 5 Longs**: Assets with highest predicted rank + key feature drivers.
+4. **Bottom 5 Shorts**: Assets with lowest predicted rank + key feature drivers.
 5. **Feature Importance**: Top 10 model features by gain with visual bars.
 6. **AI Executive Verdict**: 3-paragraph institutional analysis from OpenRouter LLM.
 
@@ -302,14 +304,13 @@ Runs on **AWS Lambda**. Two task handlers:
 #### Process
 1. Ping Hyperliquid for the top 100 assets by volume to guarantee tradability and deep liquidity.
 2. Fetch live Klines (15m, 100 candles) for all 100 symbols + BTC index.
-3. Compute continuous features (RSI, MACD, Volatility, Basis, Correlation to Index) and cyclic time features.
-4. Run all 12 strategy families to generate signal columns.
-5. Rank all continuous features cross-sectionally across the 100 assets.
-6. Download the `cross_sectional_lgbm.txt` model from S3 and predict forward return ranks.
-7. Target the Top 3 for Long positions and Bottom 3 for Short positions.
-8. **Portfolio Reconciliation**: Close any position no longer in the Top/Bottom 3 basket.
-9. Execute new basket entries via `RiskEngine`.
-10. Sync break-even and unified SL/TP orders for all active positions.
+3. Compute continuous features (RSI, MACD, Volatility, Basis, Correlation to Index, cyclic time features, and delta velocity features).
+4. Rank all continuous features cross-sectionally across the 100 assets.
+5. Download the `cross_sectional_lgbm.txt` model from S3 and predict forward return ranks.
+6. Target the Top 5 for Long positions and Bottom 5 for Short positions.
+7. **Portfolio Reconciliation**: Close any position no longer in the Top/Bottom 5 basket.
+8. Execute new basket entries via `RiskEngine`.
+9. Sync break-even and unified SL/TP orders for all active positions.
 
 ```mermaid
 flowchart TD
