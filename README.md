@@ -11,7 +11,7 @@ Alpha Factory operates in two distinct phases to maximize research depth and exe
 ### Phase 1: Local Research Hub (Weekly)
 *   **Data Ingestion**: Pulls years of high-fidelity data from **Binance Vision** archives and fills the "live edge" via Binance API.
 *   **AI Training**: Trains an **XGBoost + Random Forest Ensemble** to identify market regimes and movement conviction.
-*   **The Strategist (Grid Search)**: Performs an exhaustive backtest across **200+ symbols** and **12 strategy families**.
+*   **The Strategist (Grid Search)**: Performs an exhaustive backtest across **100+ symbols** and **12 strategy families**.
 *   **Outputs**: 
     *   `elite_squad.json`: Top 20 strategies with a Hyperliquid-tradability guarantee.
     *   `all_grid_results.json`: Full market distribution data.
