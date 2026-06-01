@@ -1,10 +1,10 @@
-# Alpha Factory 🚀
+# Alpha Factory
 
 > A professional-grade quantitative crypto research and autonomous trading system. Pure Binance data powers an exhaustive strategy grid search, an AI ensemble scout, and an autonomous executor on Hyperliquid.
 
 ---
 
-## 🏛️ Architecture: The Two-Phase Loop
+## Architecture: The Two-Phase Loop
 
 Alpha Factory operates in two distinct phases to maximize research depth and execution speed:
 
@@ -24,7 +24,7 @@ Alpha Factory operates in two distinct phases to maximize research depth and exe
 
 ---
 
-## 🛠️ Quick Start
+## Quick Start
 
 ```bash
 # 1. Setup Environment
@@ -37,7 +37,7 @@ cp .env.example .env # Add your API keys and AWS bucket
 
 ---
 
-## 🕹️ CLI Usage (`master.py`)
+## CLI Usage (`master.py`)
 
 The single entry point for all local operations:
 
@@ -53,7 +53,7 @@ The single entry point for all local operations:
 
 ---
 
-## 💎 Features
+## Features
 
 *   **100% Data Purity**: Enforces a "Pure Binance" policy — no Hyperliquid data injection for research.
 *   **12 Strategy Families**: Trend Following, Mean Reversion, Order Flow, and Hybrid systems.
@@ -63,7 +63,7 @@ The single entry point for all local operations:
 
 ---
 
-## 📁 Directory Structure
+## Directory Structure
 
 *   `backtester/`: Vectorized backtest engine & grid search orchestration.
 *   `analytics/`: ML model training and intelligence reporting.
