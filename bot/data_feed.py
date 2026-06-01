@@ -1,9 +1,11 @@
 import math
 import time
+import sqlite3
 import logging
 import pandas as pd
 from datetime import datetime, timezone
 from bot.config import AWS_BUCKET, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+from data_pipeline.database import DB_PATH
 
 logger = logging.getLogger()
 
@@ -29,7 +31,12 @@ class AssetManager:
         logger.error("🚨 FATAL: Could not load exchange rules. Bot will likely fail size routing.")
 
     def get_price_precision(self, coin, price):
-        return float(f"{float(price):.5g}")
+        # Hyperliquid is extremely strict with price decimals.
+        # For almost all assets, 5 significant figures is the maximum.
+        # If the price is very small, we also cap the absolute decimal places.
+        rounded = float(f"{price:.5g}")
+        # Secondary safety: never exceed 6 decimal places for any asset
+        return round(rounded, 6)
 
     def round_size(self, coin, size):
         safe_coin = str(coin).upper().strip()
@@ -81,8 +88,6 @@ class MarketData:
         """
         if use_db:
             try:
-                import sqlite3
-                from data_pipeline.database import DB_PATH
 
                 # Normalize symbol for DB query (e.g. BTC -> BTC/USDT)
                 if "/" not in coin and "-" not in coin:

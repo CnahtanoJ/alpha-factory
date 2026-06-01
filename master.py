@@ -8,7 +8,6 @@ Designed for local execution on your machine.
 Usage:
   python master.py ingest   --symbols BTC/USDT,ETH/USDT --timeframe 1h
   python master.py ingest   --top 50 --timeframe 15m
-  python master.py backtest
   python master.py report
   python master.py full
   python master.py status
@@ -16,6 +15,8 @@ Usage:
 
 import sys
 import os
+from dotenv import load_dotenv
+load_dotenv()
 
 # Fix Windows console encoding (cp1252 can't handle emoji)
 if sys.stdout.encoding != 'utf-8':
@@ -24,83 +25,68 @@ if sys.stdout.encoding != 'utf-8':
 
 import argparse
 import sqlite3
+import json
 from datetime import datetime
 
 # Ensure project root is in path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-def cmd_sync_live(args):
-    """Fetch the latest 100 candles for active universe from Binance API (Pure Binance policy)."""
-    print(f"\n🔄 Running Live Edge Sync (Binance Only)...")
-    import requests
-    import time
-    
-    from data_pipeline.database import DB_PATH
-    conn = sqlite3.connect(DB_PATH)
-    pairs_to_refresh = conn.execute("SELECT DISTINCT symbol, market FROM ohlcv").fetchall()
-    conn.close()
-    
-    if not pairs_to_refresh:
-        print("   ⚠️ No data found in DB. Ingest some historical data first.")
-        return
+from data_pipeline.database import DB_PATH
 
-    tf_arg = args.timeframe if hasattr(args, 'timeframe') else '1h'
-    timeframes = [t.strip() for t in tf_arg.split(',')]
-    
-    sync_count = 0
-    for current_tf in timeframes:
-        print(f"   🔄 Syncing {current_tf} edge...")
-        for symbol, market in pairs_to_refresh:
-            candles = []
-            binance_symbol = symbol.replace('/', '')  # e.g. BTC/USDT -> BTCUSDT
-            try:
-                url = "https://api.binance.com/api/v3/klines"
-                params = {'symbol': binance_symbol, 'interval': current_tf, 'limit': 100}
-                res = requests.get(url, params=params, timeout=10)
-                if res.status_code == 200:
-                    data = res.json()
-                    for c in data:
-                        candles.append({
-                            'timestamp': c[0], 'open': float(c[1]), 'high': float(c[2]),
-                            'low': float(c[3]), 'close': float(c[4]), 'volume': float(c[5]),
-                            'symbol': symbol, 'timeframe': current_tf, 'market': market
-                        })
-            except Exception as e:
-                print(f"   ❌ Binance API failed for {symbol}: {e}")
-
-            # Bulk upsert into DB
-            if candles:
-                conn = sqlite3.connect(DB_PATH)
-                cursor = conn.cursor()
-                cursor.executemany("""
-                    INSERT OR REPLACE INTO ohlcv (timestamp, symbol, timeframe, market, open, high, low, close, volume)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, [(c['timestamp'], c['symbol'], c['timeframe'], c['market'], c['open'], c['high'], c['low'], c['close'], c['volume']) for c in candles])
-                conn.commit()
-                conn.close()
-                sync_count += 1
-
-            time.sleep(0.1)  # Rate limit courtesy
-            
-    print(f"   ✅ Refreshed {sync_count} symbols with live Binance edge data.")
-
+class Tee:
+    """Redirects stdout/stderr to both the console and a file."""
+    def __init__(self, *files):
+        self.files = files
+    def write(self, obj):
+        for f in self.files:
+            f.write(obj)
+            f.flush()
+    def flush(self):
+        for f in self.files:
+            f.flush()
 
 def cmd_ingest(args):
     """Step 1: Download historical data into alpha_factory.db"""
+    # Setup timestamped logging
+    os.makedirs('logs', exist_ok=True)
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H%M")
+    log_file = os.path.join('logs', f"ingest_{timestamp}.log")
+    
+    log_f = open(log_file, 'a', encoding='utf-8')
+    original_stdout = sys.stdout
+    original_stderr = sys.stderr
+    
+    # Start Teeing
+    sys.stdout = Tee(sys.stdout, log_f)
+    sys.stderr = Tee(sys.stderr, log_f)
+    
+    try:
+        print(f"📝 Logging session started: {log_file}")
+        _run_ingest_logic(args)
+    finally:
+        print(f"📝 Logging session finished: {log_file}")
+        sys.stdout = original_stdout
+        sys.stderr = original_stderr
+        log_f.close()
+
+def _run_ingest_logic(args):
+    """The actual ingestion logic, now wrapped in logging."""
     from data_pipeline.database import init_db
     from data_pipeline.sync_manager import SyncManager
     
     init_db()
     sync = SyncManager()
     
-    market = 'spot' if args.spot else 'futures'
+    market = 'futures'
     timeframes = [t.strip() for t in args.timeframe.split(',')]
     
     if args.top:
-        # Auto-discover top symbols by volume
-        from data_pipeline.data_fetcher import get_top_symbols_by_volume
-        print(f"\n🔍 Discovering top {args.top} symbols by volume...")
-        symbols = get_top_symbols_by_volume(sync.exchange, limit=args.top)
+        # Auto-discover top symbols by volume from Hyperliquid
+        from data_pipeline.hyperliquid_sync import get_hl_top_by_volume
+        print(f"\n🔍 Discovering top {args.top} HL symbols by volume...")
+        hl_symbols = get_hl_top_by_volume(limit=args.top)
+        # Map HL symbol to Binance symbol format
+        symbols = [f"{s}/USDT" for s in hl_symbols]
         print(f"   Found: {symbols[:5]}... ({len(symbols)} total)")
     else:
         symbols = [s.strip() for s in args.symbols.split(',')]
@@ -113,62 +99,168 @@ def cmd_ingest(args):
                        target_years=args.years, start_year=args.start_year)
     
     sync.close()
-    print("\n✅ Data ingestion complete!")
+    
+    # Automate Gap Patcher
+    print("\n" + "="*60)
+    print("  🩹 UNIVERSAL GAP PATCHER")
+    print("="*60)
+    from data_pipeline.universal_gap_patcher import UniversalGapPatcher
+    patcher = UniversalGapPatcher()
+    patcher.patch_ohlcv(dry_run=False)
+    patcher.patch_index_ohlcv(dry_run=False)
+    patcher.patch_symbol_metrics(dry_run=False)
+    patcher.patch_funding_rate(dry_run=False)
+    patcher.close()
+    
+    # Automate Auditor
+    args.market = market
+    cmd_audit(args)
+    
+    print("\n✅ Full Data Ingestion, Patching, and Auditing Complete!")
+    
+def save_active_regime(all_results):
+    """
+    Evaluates all timeframe results and saves the best one to live_config.json.
+    """
+    best_tf = None
+    best_sharpe = -float('inf')
+    best_spearman = -float('inf')
 
+    for tf, res in all_results.items():
+        sim = res.get('simulation_results')
+        meta = res.get('model_meta', {})
+        
+        sharpe = sim.get('sharpe', -float('inf')) if sim else -float('inf')
+        spearman = meta.get('validation_spearman', -float('inf'))
+        
+        # Primary sort: Sharpe Ratio. Secondary: Spearman
+        if sharpe > best_sharpe:
+            best_sharpe = sharpe
+            best_spearman = spearman
+            best_tf = tf
+        elif sharpe == best_sharpe and spearman > best_spearman:
+            best_spearman = spearman
+            best_tf = tf
 
-def cmd_backtest(args):
-    """Step 2: Run Pipeline A — Extreme Grid Search + AI Scoring"""
-    # Auto-sync live edge before backtesting
-    cmd_sync_live(args)
-    
-    from analytics.analytics import train_global_xgboost, get_latest_probabilities
-    from backtester.build_bot_blueprint import strategist_handler
-    
-    print("\n🧠 Training XGBoost model...")
-    model, features, accuracy = train_global_xgboost(market=args.market, tune_hyperparams=args.tune, force_train=args.force_train)
-    
-    ai_probs = {}
-    if model:
-        print(f"   Model accuracy: {accuracy:.2%}")
-        ai_probs = get_latest_probabilities(model, features, market=args.market)
-        print(f"   Scored {len(ai_probs)} symbols.")
-    else:
-        print("   ⚠️ No data in database. Run 'ingest' first.")
-        return
-    
-    print("\n🚀 Running Pipeline A (Grid Search)...")
-    result = strategist_handler(None, None, ai_probs=ai_probs, ai_accuracy=accuracy)
-    print(f"\n✅ Pipeline A complete: {result}")
+    if best_tf:
+        config_path = os.path.join(os.path.dirname(__file__), 'bot', 'live_config.json')
+        os.makedirs(os.path.dirname(config_path), exist_ok=True)
+        with open(config_path, 'w') as f:
+            json.dump({
+                "active_timeframe": best_tf,
+                "sharpe": float(best_sharpe) if best_sharpe != -float('inf') else 0.0,
+                "spearman": float(best_spearman) if best_spearman != -float('inf') else 0.0,
+                "updated_at": datetime.now().isoformat()
+            }, f, indent=4)
+        print(f"\n👑 REGIME SWITCHER: Selected '{best_tf}' as the optimal timeframe (Sharpe: {best_sharpe:.2f}, Spearman: {best_spearman:.4f})")
+        print(f"   Saved to {config_path}")
 
+        # PHASE 2: Upload to S3 so Lambda knows which timeframe is active
+        try:
+            import boto3
+            from bot.config import AWS_BUCKET
+            s3 = boto3.client('s3')
+            with open(config_path, 'rb') as data:
+                s3.put_object(Bucket=AWS_BUCKET, Key='live_config.json', Body=data.read())
+            print(f"   ✅ live_config.json uploaded to S3 bucket '{AWS_BUCKET}'.")
+        except Exception as e:
+            print(f"   ⚠️ live_config.json S3 upload failed: {e}")
 
 def cmd_report(args):
-    """Step 3: Run Pipeline B — Weekly Intelligence Report"""
-    # Auto-sync live edge before report
-    cmd_sync_live(args)
+    """Run the Weekly Intelligence Cycle: OOS Simulate → Train → Report"""
+    os.makedirs('logs', exist_ok=True)
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H%M")
+    log_file = os.path.join('logs', f"report_{timestamp}.log")
     
-    from analytics.analytics import train_global_xgboost, get_latest_probabilities
+    log_f = open(log_file, 'a', encoding='utf-8')
+    original_stdout = sys.stdout
+    original_stderr = sys.stderr
+    
+    sys.stdout = Tee(sys.stdout, log_f)
+    sys.stderr = Tee(sys.stderr, log_f)
+    
+    try:
+        print(f"📝 Logging session started: {log_file}")
+        _run_report_logic(args)
+    finally:
+        print(f"📝 Logging session finished: {log_file}")
+        sys.stdout = original_stdout
+        sys.stderr = original_stderr
+        log_f.close()
+
+def _run_report_logic(args):
+    from analytics.weekly_orchestrator import run_weekly_cycle
     from analytics.generate_report import generate_report
     
-    print("\n🧠 Training XGBoost model...")
-    model, features, accuracy = train_global_xgboost(market=args.market, tune_hyperparams=args.tune, force_train=args.force_train)
+    timeframes = args.timeframe.split(',')
+    # PHASE 4: Enforce 4h-first training order (macro conviction needs 4h model)
+    tf_order = {'4h': 0, '1h': 1, '15m': 2}
+    timeframes = sorted([t.strip() for t in timeframes], key=lambda x: tf_order.get(x, 99))
+    all_results = {}
     
-    ai_probs = {}
-    if model:
-        print(f"   Model accuracy: {accuracy:.2%}")
-        ai_probs = get_latest_probabilities(model, features, market=args.market)
-    else:
-        print("   ⚠️ No data in database. Run 'ingest' first.")
+    print(f"\n🧠 Running Full Intelligence Cycle for timeframes: {timeframes}")
+    
+    for tf in timeframes:
+        tf = tf.strip()
+        print(f"\n--- Processing Timeframe: {tf} ---")
+        cycle_results = run_weekly_cycle(
+            market=args.market,
+            timeframe=tf,
+            force_train=args.force_train,
+            dry_run_weeks=args.dry_run_weeks,
+            optimize=getattr(args, 'optimize', False),
+            n_trials=getattr(args, 'trials', 50)
+        )
+        if isinstance(cycle_results, dict) and 'status' not in cycle_results:
+            all_results[tf] = cycle_results
+        else:
+            print(f"⚠️ Skipping {tf} due to training failure or no data.")
+    
+    if not all_results:
+        print("\n❌ No successful cycles completed. Report aborted.")
         return
+
+    print("\n📊 Generating Aggregated Intelligence Report...")
+    report_path = generate_report(all_results)
     
-    print("\n📊 Generating Weekly Intelligence Report...")
-    report_path = generate_report(ai_probs=ai_probs, ai_accuracy=accuracy)
+    save_active_regime(all_results)
     
     if report_path:
         print(f"\n✅ Report saved to: {report_path}")
+        
+        # PHASE 3: Send to Telegram
+        if args.ping_telegram:
+            print("📱 Sending report to Telegram...")
+            from bot.utils import send_telegram_message
+            with open(report_path, 'r', encoding='utf-8') as f:
+                report_content = f.read()
+            send_telegram_message(report_content)
+            print("   ✅ Telegram transmission complete.")
 
 
 def cmd_full(args):
-    """Run the full weekly cycle: Ingest (Optional) → Train once → Pipeline A → Pipeline B"""
+    """Run the full weekly cycle: Ingest (Optional) → Sync → OOS Simulate → Train → Report"""
+    os.makedirs('logs', exist_ok=True)
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H%M")
+    log_file = os.path.join('logs', f"full_cycle_{timestamp}.log")
+    
+    log_f = open(log_file, 'a', encoding='utf-8')
+    original_stdout = sys.stdout
+    original_stderr = sys.stderr
+    
+    sys.stdout = Tee(sys.stdout, log_f)
+    sys.stderr = Tee(sys.stderr, log_f)
+    
+    try:
+        print(f"📝 Logging session started: {log_file}")
+        _run_full_logic(args)
+    finally:
+        print(f"📝 Logging session finished: {log_file}")
+        sys.stdout = original_stdout
+        sys.stderr = original_stderr
+        log_f.close()
+
+def _run_full_logic(args):
     from analytics.weekly_orchestrator import run_weekly_cycle
     from analytics.generate_report import generate_report
     
@@ -177,94 +269,157 @@ def cmd_full(args):
         print("\n" + "="*60)
         print("  📥 STEP 0: BOOTSTRAP INGESTION")
         print("="*60)
-        # Map market to spot flag for cmd_ingest
-        args.spot = (args.market == 'spot')
         cmd_ingest(args)
-    
-    # 1. 🔄 SMART SYNC: Freshness Mode (The Hyperliquid Symmetry Mapping)
-    # This catches the "Live Edge" so we trade on the current minute.
-    cmd_sync_live(args)
-    
+        
     print("\n" + "="*60)
     print("  🚀 STARTING FULL WEEKLY CYCLE")
-    if args.tune or args.force_train:
-        print("     🧠 MODE: ELITE RE-TRAINING (High Fidelity Intelligence)")
+    if args.force_train:
+        print("     🧠 MODE: FORCE RE-TRAINING")
     print("="*60)
     
-    # 1. Orchestrate AI Training & Strategy Discovery (Pipeline A)
-    result = run_weekly_cycle(market=args.market, tune_hyperparams=args.tune, force_train=args.force_train)
+    # 2. Run the intelligence cycle
+    timeframes = args.timeframe.split(',')
+    # PHASE 4: Enforce 4h-first training order (macro conviction needs 4h model)
+    tf_order = {'4h': 0, '1h': 1, '15m': 2}
+    timeframes = sorted([t.strip() for t in timeframes], key=lambda x: tf_order.get(x, 99))
+    all_results = {}
     
-    probs = result['probs']
-    accuracy = result['accuracy']
+    for tf in timeframes:
+        tf = tf.strip()
+        cycle_results = run_weekly_cycle(
+            market=args.market,
+            timeframe=tf,
+            force_train=args.force_train,
+            dry_run_weeks=args.dry_run_weeks,
+            optimize=getattr(args, 'optimize', False),
+            n_trials=getattr(args, 'trials', 50)
+        )
+        if isinstance(cycle_results, dict) and 'status' not in cycle_results:
+            all_results[tf] = cycle_results
+
+    if all_results:
+        print("\n📊 Generating Aggregated Intelligence Report...")
+        report_path = generate_report(all_results)
+        save_active_regime(all_results)
+
+        # PHASE 3: Send to Telegram
+        if args.ping_telegram:
+            print("📱 Sending report to Telegram...")
+            from bot.utils import send_telegram_message
+            with open(report_path, 'r', encoding='utf-8') as f:
+                report_content = f.read()
+            send_telegram_message(report_content)
+            print("   ✅ Telegram transmission complete.")
     
     print(f"\n✅ AI Intelligence Cycle Complete!")
-    print(f"   Symbols scored: {len(probs)}")
-    print(f"   Model accuracy: {accuracy:.2%}")
-    
-    # 2. Trigger Intelligence Report (Pipeline B)
-    print("\n📊 Generating Master Intelligence Report...")
-    report_path = generate_report(ai_probs=probs, ai_accuracy=accuracy)
-    
+
 def cmd_status(args):
     """Show what data you have in the local database"""
-    from data_pipeline.database import DB_PATH
-    db_path = DB_PATH
-    
-    if not os.path.exists(db_path):
-        print(f"❌ No database found at {db_path}. Run 'python master.py ingest' first.")
-        return
-    
-    conn = sqlite3.connect(db_path)
-    conn.row_factory = sqlite3.Row
-    
-    # Count total rows
-    total = conn.execute("SELECT COUNT(*) as cnt FROM ohlcv").fetchone()['cnt']
-    
-    if total == 0:
-        print("📭 Database is empty. Run 'python master.py ingest' first.")
-        conn.close()
-        return
-    
-    print(f"\n{'='*60}")
-    print(f"  DATABASE STATUS: alpha_factory.db")
-    print(f"{'='*60}")
-    print(f"  Total candles: {total:,}")
-    
-    # Per-symbol breakdown
-    rows = conn.execute("""
-        SELECT symbol, timeframe, market, 
-               COUNT(*) as candles,
-               MIN(timestamp) as earliest,
-               MAX(timestamp) as latest
-        FROM ohlcv 
-        GROUP BY symbol, timeframe, market
-        ORDER BY candles DESC
-    """).fetchall()
-    
-    print(f"\n  {'Symbol':<15} {'TF':<6} {'Market':<8} {'Candles':>10}   {'From':<12} {'To':<12}")
-    print(f"  {'─'*15} {'─'*6} {'─'*8} {'─'*10}   {'─'*12} {'─'*12}")
-    
-    for r in rows:
-        try:
-            start = datetime.fromtimestamp(r['earliest']/1000).strftime('%Y-%m-%d')
-        except (OSError, ValueError):
-            start = "BAD_TS"
-        try:
-            end = datetime.fromtimestamp(r['latest']/1000).strftime('%Y-%m-%d')
-        except (OSError, ValueError):
-            end = "BAD_TS"
-        print(f"  {r['symbol']:<15} {r['timeframe']:<6} {r['market']:<8} {r['candles']:>10,}   {start:<12} {end:<12}")
-    
-    # Check sync state
-    sync_rows = conn.execute("SELECT COUNT(*) as cnt FROM sync_state").fetchone()['cnt']
-    print(f"\n  Tracked sync states: {sync_rows}")
-    
-    # DB file size
-    size_mb = os.path.getsize(db_path) / (1024 * 1024)
-    print(f"  Database file size: {size_mb:.1f} MB")
-    
-    conn.close()
 
+    print("\n" + "="*60)
+    print("  📊 LOCAL DATABASE STATUS")
+    print("="*60)
+
+    if not os.path.exists(DB_PATH):
+        print(f"❌ Database not found at {DB_PATH}")
+        return
+
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+
+    # Get symbols and timeframes
+    cursor.execute("SELECT symbol, timeframe, COUNT(*) as count, MIN(timestamp), MAX(timestamp) FROM ohlcv GROUP BY symbol, timeframe")
+    rows = cursor.fetchall()
+
+    if not rows:
+        print("📭 Database is empty.")
+    else:
+        print(f"{'Symbol':<15} | {'TF':<5} | {'Rows':<8} | {'Start':<20} | {'End':<20}")
+        print("-" * 75)
+        for row in rows:
+            symbol, tf, count, start, end = row
+            start_dt = datetime.fromtimestamp(start/1000).strftime('%Y-%m-%d')
+            end_dt = datetime.fromtimestamp(end/1000).strftime('%Y-%m-%d')
+            print(f"{symbol:<15} | {tf:<5} | {count:<8,} | {start_dt:<20} | {end_dt:<20}")
+
+    conn.close()
+    print("="*60)
+
+def cmd_health(args):
+    """Verify all sub-account credentials and connectivity"""
+    from hyperliquid.info import Info
+    from bot.config import BASE_URL, AWS_BUCKET
+    from bot.utils import send_telegram_message
+
+    print("\n" + "="*60)
+    print("  🩺 INFRASTRUCTURE HEALTH CHECK")
+    print("="*60)
+
+    timeframes = ['15m', '1h', '4h']
+    info = Info(BASE_URL, skip_ws=True)
+
+    for tf in timeframes:
+        suffix = tf.upper()
+        print(f"\n📡 Checking {tf} Sub-Account...")
+        
+        # Resolve keys (matching bot_executor logic)
+        if os.environ.get("TESTNET_MODE", "False").lower() == "true":
+            key = os.environ.get(f"TESTNET_PRIVATE_KEY_{suffix}", os.environ.get("TESTNET_PRIVATE_KEY"))
+            addr = os.environ.get(f"TESTNET_ACCOUNT_ADDRESS_{suffix}", os.environ.get("TESTNET_ACCOUNT_ADDRESS"))
+            mode = "TESTNET"
+        else:
+            key = os.environ.get(f"MAINNET_PRIVATE_KEY_{suffix}", os.environ.get("MAINNET_PRIVATE_KEY"))
+            addr = os.environ.get(f"MAINNET_ACCOUNT_ADDRESS_{suffix}", os.environ.get("MAINNET_ACCOUNT_ADDRESS"))
+            mode = "MAINNET"
+
+        if not key or not addr:
+            print(f"  ❌ Status: OFFLINE (Missing Keys for _{suffix})")
+            continue
+            
+        key = key.strip()
+        addr = addr.strip()
+
+        try:
+            # Try to fetch user state with Unified Logic
+            user_state = info.user_state(addr)
+            summary = user_state.get('crossMarginSummary') or user_state.get('marginSummary', {})
+            margin = float(summary.get('accountValue', 0))
+            
+            # Fallback if accountValue is 0 (Unified check)
+            if margin == 0:
+                spot_state = info.spot_user_state(addr)
+                spot_usdc = sum(float(b['total']) for b in spot_state.get('balances', []) if b['coin'] == 'USDC')
+                margin = spot_usdc
+            
+            print(f"  ✅ Status: ONLINE ({mode})")
+            print(f"  📍 Address: {addr[:6]}...{addr[-4:]}")
+            print(f"  💰 Account Value: ${margin:,.2f}")
+        except Exception as e:
+            print(f"  ❌ Status: ERROR (Connection failed: {e})")
+
+    # Check S3
+    print("\n📦 Checking AWS S3 Connectivity...")
+    try:
+        import boto3
+        client = boto3.client('s3')
+        client.list_objects_v2(Bucket=AWS_BUCKET, MaxKeys=1)
+        print(f"  ✅ Status: CONNECTED (Bucket: {AWS_BUCKET})")
+    except Exception as e:
+        print(f"  ❌ Status: FAILED ({e})")
+
+    # Check Telegram
+    print("\n📱 Checking Telegram Bot...")
+    if os.environ.get("TELEGRAM_BOT_TOKEN") and os.environ.get("TELEGRAM_CHAT_ID"):
+        print(f"  ✅ Status: CONFIGURED")
+        if args.ping_telegram:
+            print("  🔔 Sending test message...")
+            send_telegram_message("🩺 *Alpha Factory Health Check*: Connectivity Verified.")
+    else:
+        print("  ⚠️ Status: NOT CONFIGURED")
+
+    print("\n" + "="*60)
+    print("  ✅ HEALTH CHECK COMPLETE")
+    print("="*60)
 
 def cmd_audit(args):
     """Diagnose data integrity: gaps, spikes, and health scores."""
@@ -313,94 +468,6 @@ def cmd_audit(args):
         print(f"  TIP: Run 'ingest' or 'sync' to attempt gap-filling for 'Dark Zones'.")
 
 
-def cmd_scout(args):
-    """Hourly Scout Loop: Fuses Static Math with Live AI Conviction."""
-    from bot.utils import S3Interface, send_telegram_message
-    from bot.config import AWS_BUCKET
-    from analytics.analytics import get_latest_probabilities, train_global_xgboost
-    from data_pipeline.hyperliquid_sync import get_hyperliquid_universe
-    import logging
-    logger = logging.getLogger(__name__)
-    
-    logger.info("📡 SCOUT: Pulling Elite Squad from S3...")
-    s3 = S3Interface(AWS_BUCKET)
-    squad = s3.load_json("elite_squad.json")
-    
-    if not squad:
-        logger.error("❌ SCOUT: No Elite Squad found on S3. Run 'weekly' first.")
-        return
-
-    # 1. Filter for Hyperliquid Tradability
-    hl_universe = get_hyperliquid_universe()
-    executable_squad = []
-    for member in squad:
-        clean_name = member['target_coin'].split("/")[0]
-        if clean_name in hl_universe:
-            executable_squad.append(member)
-    
-    logger.info(f"🎯 SCOUT: Found {len(executable_squad)} tradable candidates on Hyperliquid.")
-
-    # 2. Get Live AI Conviction
-    # Load the existing trained model from analytics/models/
-    import pickle
-    import xgboost as xgb
-    
-    model_dir = os.path.join(os.path.dirname(__file__), 'analytics', 'models')
-    xgb_path = os.path.join(model_dir, 'xgboost_futures.json')
-    rf_path = os.path.join(model_dir, 'xgboost_futures.pkl')
-    
-    # Feature list must match what analytics.py uses for training
-    xgb_features = ['rsi', 'macd', 'macd_signal', 'macd_diff', 'ema_20', 'ema_50',
-                     'ema_200', 'volatility_20', 'z_score_20', 'volume',
-                     'timeframe_minutes', 'hour_sin', 'hour_cos', 'day_sin', 'day_cos']
-    
-    ensemble = None
-    if os.path.exists(xgb_path):
-        xgb_model = xgb.XGBClassifier()
-        xgb_model.load_model(xgb_path)
-        rf_model = None
-        if os.path.exists(rf_path):
-            with open(rf_path, 'rb') as f:
-                rf_model = pickle.load(f)
-        ensemble = (xgb_model, rf_model) if rf_model else xgb_model
-        logger.info(f"SCOUT: Loaded cached AI model from {xgb_path}")
-    else:
-        logger.warning("SCOUT: No cached model found. Training a fresh one...")
-        ensemble, xgb_features, _ = train_global_xgboost(force_train=False)
-
-    if not ensemble:
-        logger.error("❌ SCOUT: AI Brain not found. Fusing with neutral index.")
-        ai_probs = {m['target_coin']: {'bull': 0.5, 'bear': 0.5} for m in executable_squad}
-    else:
-        # Get probabilities for ONLY the squad members to save time
-        ai_probs = get_latest_probabilities(ensemble, xgb_features)
-
-    # 3. Perform the Fusion
-    fused_results = []
-    for member in executable_squad:
-        probs = ai_probs.get(member['target_coin'], {'bull': 0.5, 'bear': 0.5})
-        conviction = (probs.get('bull', 0) + probs.get('bear', 0))
-        
-        # FINAL FORMULA: Static Math * Live Conviction
-        fused_score = member['score'] * conviction
-        
-        member['live_conviction'] = conviction
-        member['fused_score'] = fused_score
-        fused_results.append(member)
-
-    # 4. Rank and Upload Intelligence
-    fused_results.sort(key=lambda x: x['fused_score'], reverse=True)
-    
-    s3.save_json("live_scout_intelligence.json", fused_results)
-    
-    best = fused_results[0] if fused_results else None
-    if best:
-        msg = f"🛰️ SCOUT REFRESH\nNew Leader: {best['target_coin']}\nFused Score: {best['fused_score']:.4f}\nAI Conviction: {best['live_conviction']:.2%}"
-        logger.info(msg)
-        # send_telegram_message(msg)
-
-    logger.info("✅ SCOUT COMPLETE: Live Intelligence updated on S3.")
-
 
 def main():
     parser = argparse.ArgumentParser(
@@ -410,17 +477,14 @@ def main():
 Examples:
   python master.py status                              Check your database
   python master.py ingest --symbols BTC/USDT,ETH/USDT  Ingest specific coins
-  python master.py ingest --top 20 --timeframe 1h,15m   Ingest top 20 by volume
-  python master.py backtest                             Run grid search (Pipeline A)
-  python master.py report                               Generate intelligence report (Pipeline B)
+  python master.py ingest --top 100 --timeframe 1h,15m  Ingest top 100 by HL volume
+  python master.py report                               Run intelligence cycle + report
   python master.py full                                 Run complete weekly cycle
-  python master.py scout                                Run hourly AI fusion
 
 Recommended first-time workflow:
-  1. python master.py ingest --symbols BTC/USDT,ETH/USDT,SOL/USDT --timeframe 1h
+  1. python master.py ingest --top 100 --timeframe 1h
   2. python master.py status
-  3. python master.py backtest
-  4. python master.py report
+  3. python master.py report
         """
     )
     
@@ -432,45 +496,44 @@ Recommended first-time workflow:
                           help='Comma-separated symbols (default: BTC,ETH,SOL)')
     p_ingest.add_argument('--top', type=int, default=0,
                           help='Auto-discover top N symbols by volume (overrides --symbols)')
-    p_ingest.add_argument('--timeframe', default='1h', 
-                          help='Comma-separated timeframes (default: 1h)')
+    p_ingest.add_argument('--timeframe', default='15m,1h,4h', 
+                          help='Comma-separated timeframes (default: 15m,1h,4h)')
     p_ingest.add_argument('--years', type=int, default=3, 
                           help='Target years of history (default: 3)')
     p_ingest.add_argument('--start-year', type=int, default=2020, dest='start_year',
                           help='Start year for Binance Vision download (default: 2020)')
-    p_ingest.add_argument('--spot', action='store_true', 
-                          help='Use Spot market data instead of Futures')
     p_ingest.set_defaults(func=cmd_ingest)
     
     # Common ML Arguments
     def add_ml_args(p):
-        p.add_argument('--market', choices=['spot', 'futures'], default='futures',
-                       help='Which market data to train/scan on (default: futures)')
-        p.add_argument('--tune', action='store_true',
-                       help='Run RandomizedSearchCV to find optimal XGBoost hyperparameters')
+        p.add_argument('--market', choices=['futures'], default='futures',
+                       help='Which market data to train on (default: futures)')
+        p.add_argument('--timeframe', default='15m,1h,4h', 
+                       help='Comma-separated timeframes to run report on (default: 15m,1h,4h)')
         p.add_argument('--force-train', '--force', action='store_true', dest='force_train',
                        help='Force retraining the model even if a cached version exists')
+        p.add_argument('--dry-run-weeks', type=int, default=4, dest='dry_run_weeks',
+                       help='Number of weeks to simulate in OOS dry run (default: 4)')
+        p.add_argument('--optimize', action='store_true', dest='optimize',
+                       help='Run Optuna Hyperparameter Optimization before training')
+        p.add_argument('--trials', type=int, default=50, dest='trials',
+                       help='Number of Optuna trials to run if --optimize is set (default: 50)')
+        p.add_argument('--ping', action='store_true', dest='ping_telegram',
+                       help='Send the generated report to Telegram')
 
-    # ── backtest ──
-    p_backtest = subparsers.add_parser('backtest', help='Run Pipeline A: Grid Search + AI Scoring')
-    add_ml_args(p_backtest)
-    p_backtest.set_defaults(func=cmd_backtest)
-    
     # ── report ──
-    p_report = subparsers.add_parser('report', help='Run Pipeline B: Weekly Intelligence Report')
+    p_report = subparsers.add_parser('report', help='Run intelligence cycle + generate report')
     add_ml_args(p_report)
     p_report.set_defaults(func=cmd_report)
     
     
     # ── full ──
-    p_full = subparsers.add_parser('full', help='Run complete end-to-end cycle (Ingest? → Train → A → B)')
+    p_full = subparsers.add_parser('full', help='Run complete end-to-end cycle (Ingest? → Sync → Train → Report)')
     # Include Ingest Args
     p_full.add_argument('--symbols', default='BTC/USDT,ETH/USDT,SOL/USDT', 
                           help='Symbols to ingest if bootstrapping')
     p_full.add_argument('--top', type=int, default=0,
                           help='Auto-discover top N symbols to bootstrap')
-    p_full.add_argument('--timeframe', default='1h', 
-                          help='Timeframes to ingest (default: 1h)')
     p_full.add_argument('--years', type=int, default=3, 
                           help='Years of history to fetch (default: 3)')
     p_full.add_argument('--start-year', type=int, default=2020, dest='start_year',
@@ -488,10 +551,12 @@ Recommended first-time workflow:
     # ── status ──
     p_status = subparsers.add_parser('status', help='Check database contents')
     p_status.set_defaults(func=cmd_status)
-
-    # ── scout ──
-    p_scout = subparsers.add_parser('scout', help='Hourly AI re-inference and fusion')
-    p_scout.set_defaults(func=cmd_scout)
+    
+    # ── health ──
+    p_health = subparsers.add_parser('health', help='Verify all sub-account credentials and connectivity')
+    p_health.add_argument('--ping', action='store_true', dest='ping_telegram',
+                          help='Send a test message to Telegram if configured')
+    p_health.set_defaults(func=cmd_health)
     
     args = parser.parse_args()
     

@@ -9,7 +9,13 @@ ENV/
 
 # Databases
 *.db
+*.db-shm
+*.db-wal
 *.sqlite3
+
+# Models
+analytics/models/*
+!analytics/models/best_params_*.json
 
 # Environment & Secrets
 .env
@@ -22,15 +28,12 @@ data/
 downloads/
 *.zip
 *.csv
-*.json
-!elite_squad.json
-!champion_blueprint.json
-!all_grid_results.json
-!analytics/models/*.json
-!analytics/models/*.pkl
+*.txt
+*.pkl
+!requirements.txt
 
 # Reports
-weekly_intelligence_report.md
+reports/
 
 # IDEs
 .vscode/
@@ -39,4 +42,4 @@ weekly_intelligence_report.md
 
 # Misc
 *.log
-scratch/old_*
+scratch/

@@ -1,148 +1,184 @@
 """
-Global Intelligence Report Generator.
+Weekly Intelligence Report Generator.
 
-Produces a comprehensive Markdown report from the Alpha Factory's
-grid search results and Elite Squad data.
+Produces a comprehensive Markdown report from:
+  - OOS Dry Run Simulation results (Sharpe, PF, Win Rate)
+  - LightGBM Feature Importance (model's top drivers)
+  - Top 10 / Bottom 10 asset rankings with per-asset feature attribution
+  - AI Executive Verdict from OpenRouter LLM
 
-Data sources:
-  - elite_squad.json        — Top 20 ranked strategies (for the leaderboard table)
-  - all_grid_results.json   — ALL passing strategies (for distribution analysis)
+Now supports multiple timeframes in a single report.
 """
-import json
 import os
 from datetime import datetime
+from analytics.llm_analyzer import get_llm_verdict, build_llm_context
 
+REPORT_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'reports')
 
-SQUAD_FILE = "elite_squad.json"
-ALL_RESULTS_FILE = "all_grid_results.json"
+def build_report_section(timeframe: str, cycle_results: dict) -> str:
+    """Builds a single timeframe's section of the report."""
+    sim = cycle_results.get('simulation_results')
+    feat_imp = cycle_results.get('feature_importance', {})
+    drivers = cycle_results.get('per_asset_drivers', {})
+    model_meta = cycle_results.get('model_meta', {})
+    top_n = cycle_results.get('top_n', 10)
+    bottom_n = cycle_results.get('bottom_n', 10)
 
+    md = f"## ⏱️ Timeframe: {timeframe}\n\n"
 
-def generate_report(ai_probs=None, ai_accuracy=0.0):
+    # --- Section 1: Model Health ---
+    md += "### 📊 Model Training Summary\n"
+    rmse = model_meta.get('validation_rmse', 'N/A')
+    oos_spearman = sim.get('oos_spearman', 'N/A') if sim else 'N/A'
+
+    def fmt(v):
+        return f"{v:.4f}" if isinstance(v, (int, float)) else str(v)
+
+    if isinstance(oos_spearman, float):
+        if oos_spearman > 0.05:
+            health = "🟢 Strong"
+        elif oos_spearman > 0.03:
+            health = "🟡 Moderate"
+        elif oos_spearman > 0.02:
+            health = "🟠 Weak"
+        else:
+            health = "🔴 No Signal"
+        md += f"> Model Health: {health} | OOS Spearman ρ = **{oos_spearman:.4f}** | RMSE = {fmt(rmse)}\n\n"
+    else:
+        md += f"> Model Health: Unknown | RMSE = {fmt(rmse)} | OOS Spearman = {oos_spearman}\n\n"
+
+    # --- Section 2: OOS Simulation Results ---
+    md += "### 🔬 Out-of-Sample Dry Run\n"
+    md += "*Results use LAST week's model on THIS week's data.*\n\n"
+
+    if sim and sim.get('n_rebalances', 0) > 0:
+        md += "| Metric | Value |\n"
+        md += "| :--- | :--- |\n"
+        md += f"| **Total Return** | {sim['total_return']:+.2%} |\n"
+        md += f"| **Raw Sharpe** | {sim['sharpe']:.2f} |\n"
+        md += f"| **Ann. Sharpe** | {sim.get('annualized_sharpe', 0.0):.2f} |\n"
+        md += f"| **Profit Factor** | {sim['profit_factor']:.2f} |\n"
+        md += f"| **Win Rate** | {sim['win_rate']:.1%} |\n"
+        md += f"| **Max Drawdown** | {sim['max_drawdown']:.2%} |\n"
+        md += f"| **Rebalances** | {sim['n_rebalances']} |\n"
+        md += f"| **Avg Daily Return** | {sim['avg_daily_return']:+.4%} |\n\n"
+
+        if 'mc_stats' in sim:
+            mc = sim['mc_stats']
+            md += "#### 🛡️ Robustness Analysis (Monte Carlo)\n"
+            md += f"- **Probability of Profit**: {mc['prob_profit']:.1%}\n"
+            md += f"- **95% CI**: [{mc['ci_lower']:+.2%}, {mc['ci_upper']:+.2%}]\n\n"
+    else:
+        md += "> ⚠️ No OOS simulation available. This is the first training run.\n\n"
+
+    # --- Section 3: Top Assets ---
+    top_symbols = drivers.get('top_symbols', [])
+    top_drv = drivers.get('top_drivers', {})
+
+    md += f"#### 🟢 Top {len(top_symbols)} Longs\n"
+    md += "| Rank | Symbol | Score | Key Drivers |\n"
+    md += "| :--- | :--- | :--- | :--- |\n"
+
+    for i, entry in enumerate(top_symbols):
+        sym = entry['symbol']
+        rank = entry['predicted_rank']
+        d = top_drv.get(sym, {})
+        driver_str = ", ".join([f"`{k}`" for k in list(d.keys())[:3]]) if d else "—"
+        md += f"| {i+1} | **{sym}** | {rank:.4f} | {driver_str} |\n"
+
+    # --- Section 4: Bottom Assets ---
+    bottom_symbols = drivers.get('bottom_symbols', [])
+    bottom_drv = drivers.get('bottom_drivers', {})
+
+    md += f"\n#### 🔴 Bottom {len(bottom_symbols)} Shorts\n"
+    md += "| Rank | Symbol | Score | Key Drivers |\n"
+    md += "| :--- | :--- | :--- | :--- |\n"
+
+    for i, entry in enumerate(bottom_symbols):
+        sym = entry['symbol']
+        rank = entry['predicted_rank']
+        d = bottom_drv.get(sym, {})
+        driver_str = ", ".join([f"`{k}`" for k in list(d.keys())[:3]]) if d else "—"
+        md += f"| {i+1} | **{sym}** | {rank:.4f} | {driver_str} |\n"
+
+    md += "\n---\n\n"
+    return md
+
+def generate_report(multi_results: dict) -> str:
     """
-    Backward-compatible entry point called by master.py cmd_report / cmd_full.
-    Reads the Elite Squad + full grid results and produces the weekly intelligence report.
-    Returns the path to the generated report file.
+    Generate the Weekly Intelligence Report for multiple timeframes.
+
+    Parameters
+    ----------
+    multi_results : dict
+        Dict mapping timeframe strings ('15m', '1h', etc.) to results dictionaries.
     """
-    reporter = IntelligenceReporter()
-    reporter.generate(ai_probs=ai_probs, ai_accuracy=ai_accuracy)
-    return reporter.report_path
+    os.makedirs(REPORT_DIR, exist_ok=True)
 
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+    timestamp_file = datetime.now().strftime("%Y%m%d_%H%M")
 
-class IntelligenceReporter:
-    def __init__(self):
-        self.report_path = "weekly_intelligence_report.md"
+    md = f"# Weekly Multi-Timeframe Intelligence Report\n"
+    md += f"*Generated: {now_str} UTC*\n\n"
 
-    def _load_json(self, path):
-        if os.path.exists(path):
-            with open(path, "r") as f:
-                return json.load(f)
-        return []
+    # --- Table of Contents ---
+    md += "## 📌 Summary of Metrics\n\n"
+    md += "| Timeframe | Return | Sharpe | Win Rate | Spearman ρ |\n"
+    md += "| :--- | :--- | :--- | :--- | :--- |\n"
+    
+    for tf, res in multi_results.items():
+        sim = res.get('simulation_results')
+        meta = res.get('model_meta', {})
+        ret = f"{sim['total_return']:+.2%}" if sim else "N/A"
+        sha = f"{sim['sharpe']:.2f} ({sim.get('annualized_sharpe', 0.0):.2f} Ann.)" if sim else "N/A"
+        win = f"{sim['win_rate']:.1%}" if sim else "N/A"
+        rho = f"{sim.get('oos_spearman', 0):.4f}" if sim else "N/A"
+        md += f"| **{tf}** | {ret} | {sha} | {win} | {rho} |\n"
+    
+    md += "\n"
 
-    def generate(self, ai_probs=None, ai_accuracy=0.0):
-        """Generates a professional Markdown report of the Alpha Factory results."""
-        squad = self._load_json(SQUAD_FILE)
-        all_results = self._load_json(ALL_RESULTS_FILE)
+    # --- Timeframe Sections ---
+    for tf, res in multi_results.items():
+        md += build_report_section(tf, res)
 
-        now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+    # --- Section 6: AI Executive Verdict (Using the strongest timeframe as context) ---
+    md += "## 🤖 AI Executive Verdict\n\n"
+    
+    # Heuristic: use the timeframe with the highest Spearman for the LLM context
+    best_tf = max(multi_results.keys(), key=lambda k: multi_results[k].get('model_meta', {}).get('validation_spearman', 0))
+    best_res = multi_results[best_tf]
+    
+    llm_context = build_llm_context(
+        best_res.get('simulation_results'),
+        best_res.get('feature_importance', {}),
+        best_res.get('per_asset_drivers', {}),
+        best_res.get('model_meta', {})
+    )
+    # Add a note about multiple timeframes to the context
+    llm_context += f"\nNote: This verdict is primarily based on the {best_tf} timeframe, which showed the highest predictive accuracy."
+    
+    verdict = get_llm_verdict(llm_context)
+    md += f"{verdict}\n"
 
-        md = f"""# Global Market Intelligence Report
-*Generated At: {now_str}*
-
-"""
-        if ai_accuracy > 0:
-            md += f"> AI Ensemble Accuracy: **{ai_accuracy:.2%}**\n\n"
-
-        # --- Summary ---
-        md += f"> **Grid Search**: {len(all_results)} strategies passed filters across all symbols.\n"
-        md += f"> **Elite Squad**: Top {len(squad)} ranked by Pure Math Score.\n\n"
-
-        # --- Section 1: Elite Squad Leaderboard ---
-        md += f"""## The Elite Squad (Top {len(squad)} Leaders)
-These represent the highest historical math performers across the entire database.
-
-| Rank | Symbol | TF | Strategy | Alpha | Sharpe | PF | Pure Math Score |
-| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-"""
-        for i, r in enumerate(squad):
-            md += (
-                f"| {i+1} "
-                f"| {r.get('target_coin', 'N/A')} "
-                f"| {r.get('timeframe', '-')} "
-                f"| {r.get('strategy', '-')} "
-                f"| {r.get('alpha', 0):.2%} "
-                f"| {r.get('sharpe', 0):.2f} "
-                f"| {r.get('profit_factor', 0):.2f} "
-                f"| **{r.get('score', 0):.4f}** |\n"
-            )
-
-        # --- Section 2: Strategy Distribution (from ALL passing results) ---
-        source = all_results if all_results else squad
-        source_label = f"All {len(source)} Passing Strategies" if all_results else "Elite Squad"
-
-        if source:
-            strat_counts = {}
-            tf_counts = {}
-            coin_counts = {}
-            for r in source:
-                s = r.get('strategy', 'Unknown')
-                t = r.get('timeframe', 'Unknown')
-                c = r.get('target_coin', 'Unknown')
-                strat_counts[s] = strat_counts.get(s, 0) + 1
-                tf_counts[t] = tf_counts.get(t, 0) + 1
-                coin_counts[c] = coin_counts.get(c, 0) + 1
-
-            md += f"\n## Strategy Distribution ({source_label})\n"
-            md += "| Strategy | Count | Share |\n| :--- | :--- | :--- |\n"
-            total = len(source)
-            for s, c in sorted(strat_counts.items(), key=lambda x: -x[1]):
-                md += f"| {s} | {c} | {c/total:.0%} |\n"
-
-            md += f"\n## Timeframe Distribution ({source_label})\n"
-            md += "| Timeframe | Count | Share |\n| :--- | :--- | :--- |\n"
-            for t, c in sorted(tf_counts.items(), key=lambda x: -x[1]):
-                md += f"| {t} | {c} | {c/total:.0%} |\n"
-
-            md += f"\n## Top Tokens by Strategy Count ({source_label})\n"
-            md += "| Token | Passing Strategies | Best Score |\n| :--- | :--- | :--- |\n"
-            # For each top coin, find its best score
-            for coin, count in sorted(coin_counts.items(), key=lambda x: -x[1])[:20]:
-                best_score = max(
-                    (r.get('score', 0) for r in source if r.get('target_coin') == coin),
-                    default=0
-                )
-                md += f"| {coin} | {count} | {best_score:.4f} |\n"
-
-        # --- Section 3: AI Conviction (if available) ---
-        if ai_probs:
-            sorted_probs = sorted(
-                ai_probs.items(),
-                key=lambda x: x[1].get('bull', 0) + x[1].get('bear', 0),
-                reverse=True
-            )
-            md += "\n## AI Movement Conviction (Top 15)\n"
-            md += "| Symbol | P(Bull) | P(Bear) | P(Flat) | Movement |\n"
-            md += "| :--- | :--- | :--- | :--- | :--- |\n"
-            for sym, p in sorted_probs[:15]:
-                movement = p.get('bull', 0) + p.get('bear', 0)
-                md += (
-                    f"| {sym} "
-                    f"| {p.get('bull', 0):.2%} "
-                    f"| {p.get('bear', 0):.2%} "
-                    f"| {p.get('flat', 0):.2%} "
-                    f"| **{movement:.2%}** |\n"
-                )
-
-        md += """
+    # --- Footer ---
+    md += """
 ---
-> **Note**: This report covers the **entire database** (unfiltered).
-> To see which candidates are tradable on Hyperliquid, run `python master.py scout`.
+> **Note**: This report integrates results from multiple LightGBM Cross-Sectional models.
+> OOS metrics use last week's model for each timeframe. 
+> Rankings reflect predictions for the upcoming week.
 """
-        with open(self.report_path, "w", encoding="utf-8") as f:
-            f.write(md)
 
-        print(f"Report saved to {self.report_path}")
-        return self.report_path
+    # --- Save ---
+    latest_path = os.path.join(REPORT_DIR, "latest_multi_tf_report.md")
+    with open(latest_path, "w", encoding="utf-8") as f:
+        f.write(md)
 
+    archive_path = os.path.join(REPORT_DIR, f"multi_tf_report_{timestamp_file}.md")
+    with open(archive_path, "w", encoding="utf-8") as f:
+        f.write(md)
+
+    print(f"📄 Aggregated report saved to {latest_path}")
+    return latest_path
 
 if __name__ == "__main__":
-    generate_report()
+    print("⚠️ Use 'python master.py report' to generate a report with full cycle data.")

@@ -1,0 +1,20 @@
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.git
+.gitignore
+.vscode
+.env
+logs/
+reports/
+alpha_factory.db*
+*.md
+.dockerignore
+Dockerfile
+build_and_push.ps1
+# requirements.txt is needed for the build process, so we remove it from ignore
+# master.py is also excluded as it is only for local research loop
+master.py
+# Models are downloaded from S3 at runtime, no need to bake them into the image
+analytics/models/

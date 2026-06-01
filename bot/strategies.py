@@ -660,35 +660,25 @@ STRATEGY_CONFIG = {
     "RSIStrategyTurbo": {
         "class": RSIStrategy_Turbo, 
         "params": {
-            "period": [6, 9, 14], 
-            "adx_threshold": [15, 20, 25, 30]
+            "period": [14], # Locked to standard. 
+            "adx_threshold": [20, 25] # [Weak Trend Filter, Strong Trend Filter]
         }
     },
 
     "BollingerBandit": {
         "class": BollingerReversion,
         "params": {
-            "window": [15,20], 
-            "std": [2,2.5],
-        }
-    },
-
-    "OrderFlow": {
-        "class": OrderFlowStrategy,
-        "params": {
-            "lookback": [50, 100, 200],
-            "cvd_lookback": [5, 10], 
-            "adx_period": [7], 
-            "adx_threshold": [15, 20, 25, 30]
+            "window": [20], 
+            "std": [2.0, 2.5] # [Standard Deviation, Extreme Deviation]
         }
     },
 
     "OrderFlowSweep": {
         "class": OrderFlowSweep,
         "params": {
-            "window": [20, 30, 50, 100], 
-            "cvd_lookback": [2, 3, 5], 
-            "vol_multiplier": [1.2, 1.5, 1.8]
+            "window": [20, 50], # [Fast Liquidity, Medium Liquidity]
+            "cvd_lookback": [3, 5], 
+            "vol_multiplier": [1.5, 2.5] # [Noticeable Volume, Extreme Volume]
         }
     },
 
@@ -696,12 +686,12 @@ STRATEGY_CONFIG = {
     "MACDStrategy": {
         "class": MACDStrategy,
         "params": {
-            "fast": [8, 12], 
-            "slow": [21, 26], 
-            "signal": [9],
-            "adx_threshold": [15, 20, 25, 30],
-            "use_vwap": [True, False], # <--- DO THIS
-            "use_htf": [True, False]   # <--- AND THIS
+            "fast": [12], # Locked
+            "slow": [26], # Locked
+            "signal": [9], # Locked
+            "adx_threshold": [20, 25],
+            "use_vwap": [False], # MACD is price-based momentum. Keep VWAP out of it.
+            "use_htf": [True]    # Trend following REQUIRES higher timeframe confirmation.
         }
     },
 
@@ -711,27 +701,8 @@ STRATEGY_CONFIG = {
             "bb_window": [20], 
             "bb_std": [2], 
             "squeeze_lookback": [30, 50],
-            "use_vwap":[True, False],
-            "use_htf": [True, False]
-        }
-    },
-
-    "EMACrossover": {
-        "class": EMACrossover,
-        "params": {
-            "fast": [9, 20], 
-            "slow": [21, 50],
-            "use_vwap": [True, False],
-            "use_htf": [True, False]
-        }
-    },
-
-    "OrderFlowReclaim": {
-        "class": OrderFlowReclaim,
-        "params": {
-            "window": [20, 30, 50], # Keep it fast to capture momentum
-            "cvd_lookback": [3, 5], 
-            "vol_multiplier": [1.2, 1.5, 1.8]
+            "use_vwap": [False], # A breakout without volume is a fakeout. Locked to True.
+            "use_htf": [True]   # Locked to True.
         }
     },
 
@@ -741,36 +712,26 @@ STRATEGY_CONFIG = {
         "params": {
             "rsi_period": [14], 
             "bb_window": [20],
-            "bb_std": [2],
-        }
-    },
-
-    "HybridCutler": {
-        "class": HybridRSIBollinger_Cutler,
-        "params": {
-            "rsi_period": [14], 
-            "bb_window": [20],
-            "bb_std": [2],
+            "bb_std": [2.0, 2.5],
         }
     },
     
-    # 4. WILDCARD (For Moonshots only) ---------------------------
+    # 4. WILDCARD / PRICE ACTION ---------------------------------
     "SimpleBreakout": {
         "class": SimpleBreakout,
         "params": {
-            "n": [20, 50],
-            "use_vwap": [True, False],
-            "use_htf": [True, False]
+            "n": [20, 50], # [Local High, Major High]
+            "use_vwap": [False], # Locked
+            "use_htf": [True]   # Locked
         } 
     },
 
-    # NEW STRATEGY
     "PriceAction": {
         "class": PriceActionStrategy,
         "params": {
-            "window": [20, 30, 50, 100], 
-            "vol_multiplier": [1.5, 1.8, 2.0, 2.5, 3],
-            "use_htf": [True, False]
+            "window": [20, 50], 
+            "vol_multiplier": [1.5, 2.0, 3.0], # Distinct, widened tiers of volume shock
+            "use_htf": [True] # Locked
         }
     }
 }
