@@ -27,5 +27,9 @@ jobs:
         pip install -r requirements.txt
 
     - name: Run Tests
+      env:
+        AWS_ACCESS_KEY_ID: dummy
+        AWS_SECRET_ACCESS_KEY: dummy
+        AWS_DEFAULT_REGION: us-east-1
       run: |
         python -m unittest discover -s tests -p "test_*.py"

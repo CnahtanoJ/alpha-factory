@@ -8,10 +8,15 @@ from bot.risk_engine import RiskEngine
 
 class TestRiskEngine(unittest.TestCase):
     def setUp(self):
+        # Mock StateManager before instantiating RiskEngine to avoid real S3 calls
+        self.patcher = patch("bot.risk_engine.StateManager")
+        self.mock_state_manager = self.patcher.start()
+        self.mock_memory = MagicMock()
+        self.mock_state_manager.return_value = self.mock_memory
+
         # Mock components
         self.mock_exchange = MagicMock()
         self.mock_info = MagicMock()
-        self.mock_memory = MagicMock()
 
         # Initialize RiskEngine with mocked dependencies
         self.engine = RiskEngine(
@@ -20,7 +25,9 @@ class TestRiskEngine(unittest.TestCase):
             account_address="0x1234567890abcdef",
             bucket="mock-bucket",
         )
-        self.engine.memory = self.mock_memory
+
+    def tearDown(self):
+        self.patcher.stop()
 
     def test_margin_check_bankruptcy(self):
         # Account value is 0 (bankruptcy)
