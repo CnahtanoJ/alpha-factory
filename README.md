@@ -48,7 +48,7 @@ The single entry point for all local operations:
 | `python master.py backtest` | Run the weekly ML training + Global Grid Search. |
 | `python master.py report` | Generate the Weekly Intelligence Markdown report. |
 | `python master.py full` | Run the entire weekly cycle from Sync to Report. |
-| `python master.py scout` | Re-score the elite squad (Hourly loop). |
+| `python master.py scout` | Re-score the top performers (Hourly loop). |
 | `python master.py audit` | Run a non-destructive health check (Gaps/Spikes) on the DB. |
 
 ---
@@ -59,7 +59,7 @@ The single entry point for all local operations:
 *   **12 Strategy Families**: Trend Following, Mean Reversion, Order Flow, and Hybrid systems.
 *   **AI Ensemble**: Multi-model (XGB+RF) movement conviction scoring.
 *   **Risk Engine**: Integrated funding traps, OI floors, and Point-of-Control (POC) gravity checks.
-*   **Telegram Guard**: Real-time private reporting of all trades and PnL receipts.
+*   **Telegram Notifier**: Real-time private reporting of all trades and PnL receipts.
 
 ---
 

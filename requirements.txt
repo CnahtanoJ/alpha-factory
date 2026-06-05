@@ -2,7 +2,7 @@ pandas==2.2.2
 numpy==1.26.4
 ta==0.11.0
 python-dotenv==1.0.1
-plotly
+plotly==6.7.0
 matplotlib==3.8.4
 scipy==1.12.0
 boto3==1.34.106
@@ -11,6 +11,6 @@ hyperliquid-python-sdk==0.5.0
 eth-account==0.8.0
 lightgbm==4.3.0
 xgboost==2.0.3
-optuna
+optuna==4.8.0
 scikit-learn==1.3.2
 joblib==1.3.2

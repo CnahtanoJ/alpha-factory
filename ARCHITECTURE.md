@@ -14,7 +14,7 @@ Alpha Factory is a **two-phase** system:
 
 ---
 
-## 💎 Institutional Alpha Features (Phase 4 Hardening)
+## Advanced Features (Phase 4 Hardening)
 
 The system now implements advanced quant-finance patterns to eliminate bias and maximize predictive reliability:
 
@@ -146,7 +146,7 @@ asset-analysis/
 │   ├── risk_engine.py               #   RiskEngine: margin safety, SL/TP, break-even, zombies
 │   ├── data_feed.py                 #   MarketData (API + local DB), AssetManager, daily receipt
 │   ├── indicators.py                #   ADX (Wilder), Point of Control, CVD slope
-│   └── utils.py                     #   S3Interface, StateManager, Telegram Guard
+│   └── utils.py                     #   S3Interface, StateManager, Telegram Notifier
 │
 └── reports/                         # Archived timestamped intelligence reports
 ```
@@ -163,7 +163,7 @@ python master.py ingest --top 100
 ```
 Default timeframes: `15m, 1h, 4h`.
 
-This triggers the **God Mode Pipeline** (fully automated):
+This triggers the **Automated Pipeline** (fully automated):
 1. **Symbol Discovery**: `hyperliquid_sync.get_hl_top_by_volume(100)` → Top 100 HL perps by 24h volume.
 2. **Binance Vision Download** (per symbol): `sync_manager.sync_from_binance_vision()` fetches 4 data types:
    - `klines` → `ohlcv` table
@@ -221,7 +221,7 @@ Uses **WAL** journal mode with tuned cache for concurrent read performance.
 A **LightGBM regression model** trained on cross-sectionally ranked features to predict the forward return rank of each asset relative to the entire market.
 
 ### Training Pipeline
-1. **Mega-DataFrame Construction**: Fetches all symbols from the database. For each symbol, merges `ohlcv`, `index_ohlcv`, `symbol_metrics`, and `funding_rate` via `merge_asof`.
+1. **Aggregated DataFrame Construction**: Fetches all symbols from the database. For each symbol, merges `ohlcv`, `index_ohlcv`, `symbol_metrics`, and `funding_rate` via `merge_asof`.
 2. **Feature Engineering**: Computes per-symbol indicators (RSI, MACD, volatility), derivative fuel (basis, OI z-score, funding delta, whale vs. retail sentiment divergence), market correlation (`corr_to_index`), cyclic time features (`hour_sin/cos`, `day_sin/cos`), and dynamic momentum and volatility delta features.
 3. **Cross-Sectional Ranking**: At each timestamp, all continuous features are ranked across symbols using percentile ranks (`rank(pct=True)`).
 4. **Walk-Forward Split**: 85% train / 15% validation (chronological, no leakage).
@@ -274,7 +274,7 @@ A **LightGBM regression model** trained on cross-sectionally ranked features to 
 **Goal**: Generate a human-readable Markdown report with Glass-Box AI analysis.
 
 ### Report Sections
-1. **Model Training Summary**: Spearman ρ, RMSE, health grade (🟢/🟡/🔴).
+1. **Model Training Summary**: Spearman ρ, RMSE, health grade (//).
 2. **OOS Dry Run Results**: Sharpe, PF, Win Rate, Max Drawdown.
 3. **Top 5 Longs**: Assets with highest predicted rank + key feature drivers.
 4. **Bottom 5 Shorts**: Assets with lowest predicted rank + key feature drivers.
@@ -329,7 +329,7 @@ flowchart TD
     M["Sync Break-Even & Unified SL/TP"]
 
     A --> B --> C
-    C -->|Fail| BAIL["📉 Stay flat"]
+    C -->|Fail| BAIL["Stay flat"]
     C -->|Pass| D --> E --> F --> G --> H --> I --> J --> K --> L --> M
 ```
 
@@ -366,7 +366,7 @@ All strategies implement `VectorStrategy.get_signal_column(df) → Series[0, 1, 
 ### Mean Reversion
 | Strategy | Key Idea | Exits |
 |:--|:--|:--|
-| `RSIStrategy_Turbo` | Fast RSI hooks + BB crash override | Smart 2 (re-entry zone) |
+| `RSIStrategyFast` | Fast RSI hooks + BB crash override | Smart 2 (re-entry zone) |
 | `BollingerReversion` | Band touch + green/red bounce confirm | Smart 2 (failed bounce) |
 | `OrderFlow` | VWAP Value Area + CVD absorption | Smart 2 (CVD flip) |
 
@@ -462,6 +462,6 @@ Universal Gap Patcher (Daily ZIPs + Unfillable Blacklist)
               └── RiskEngine Execution → Hyperliquid
                                 │
                                 ▼
-                     Telegram Guard
+                     Telegram Notifier
                   (Private PnL Reports)
 ```

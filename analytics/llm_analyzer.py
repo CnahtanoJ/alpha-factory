@@ -5,6 +5,7 @@ Feeds the LLM not just numbers, but the model's feature importance
 and per-asset drivers so it can write an intelligent, deeply technical
 intelligence report instead of hallucinating narratives.
 """
+
 import os
 import requests
 from dotenv import load_dotenv
@@ -56,12 +57,9 @@ def get_llm_verdict(context_str: str) -> str:
     """
     api_key = os.getenv("OPENROUTER_API_KEY")
     if not api_key:
-        return "⚠️ OPENROUTER_API_KEY not found in environment variables. Add it to .env to enable the AI Verdict."
+        return "OPENROUTER_API_KEY not found in environment variables. Add it to .env to enable the AI Verdict."
 
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json"
-    }
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
 
     model = os.getenv("OPENROUTER_MODEL", "qwen/qwen-2.5-72b-instruct")
 
@@ -69,10 +67,13 @@ def get_llm_verdict(context_str: str) -> str:
         "model": model,
         "messages": [
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": f"Here is the full Glass-Box context from this week's Alpha Factory cycle:\n\n{context_str}\n\nDeliver your Executive Intelligence Verdict."}
+            {
+                "role": "user",
+                "content": f"Here is the full Glass-Box context from this week's Alpha Factory cycle:\n\n{context_str}\n\nDeliver your Executive Intelligence Verdict.",
+            },
         ],
         "temperature": 0.3,
-        "max_tokens": 1500
+        "max_tokens": 1500,
     }
 
     try:
@@ -80,13 +81,13 @@ def get_llm_verdict(context_str: str) -> str:
             "https://openrouter.ai/api/v1/chat/completions",
             headers=headers,
             json=payload,
-            timeout=60
+            timeout=60,
         )
         response.raise_for_status()
         data = response.json()
-        return data['choices'][0]['message']['content'].strip()
+        return data["choices"][0]["message"]["content"].strip()
     except Exception as e:
-        return f"⚠️ LLM Analysis Failed: {str(e)}"
+        return f"LLM Analysis Failed: {str(e)}"
 
 
 def build_llm_context(
@@ -111,9 +112,9 @@ def build_llm_context(
         lines.append(f"  Win Rate:         {simulation_results['win_rate']:.1%}")
         lines.append(f"  Max Drawdown:     {simulation_results['max_drawdown']:.2%}")
         lines.append(f"  Rebalance Count:  {simulation_results['n_rebalances']}")
-        
-        if 'mc_stats' in simulation_results:
-            mc = simulation_results['mc_stats']
+
+        if "mc_stats" in simulation_results:
+            mc = simulation_results["mc_stats"]
             lines.append(f"  MC Prob. Profit:  {mc['prob_profit']:.1%}")
             lines.append(f"  MC 95% CI Lower:  {mc['ci_lower']:+.2%}")
             lines.append(f"  MC 95% CI Upper:  {mc['ci_upper']:+.2%}")
@@ -128,29 +129,41 @@ def build_llm_context(
 
     # Section 3: Per-Asset Drivers
     lines.append("\n## 3. TOP 5 LONGS — Asset Drivers")
-    top_symbols = per_asset_drivers.get('top_symbols', [])
-    top_drivers = per_asset_drivers.get('top_drivers', {})
+    top_symbols = per_asset_drivers.get("top_symbols", [])
+    top_drivers = per_asset_drivers.get("top_drivers", {})
     for entry in top_symbols:
-        sym = entry['symbol']
-        rank = entry['predicted_rank']
+        sym = entry["symbol"]
+        rank = entry["predicted_rank"]
         drivers = top_drivers.get(sym, {})
-        driver_str = ", ".join([f"{k}: {v}" for k, v in drivers.items()]) if drivers else "No extreme features"
+        driver_str = (
+            ", ".join([f"{k}: {v}" for k, v in drivers.items()])
+            if drivers
+            else "No extreme features"
+        )
         lines.append(f"  {sym:15s} (rank: {rank:.4f}) → {driver_str}")
 
     lines.append("\n## 4. BOTTOM 5 SHORTS — Asset Drivers")
-    bottom_symbols = per_asset_drivers.get('bottom_symbols', [])
-    bottom_drivers = per_asset_drivers.get('bottom_drivers', {})
+    bottom_symbols = per_asset_drivers.get("bottom_symbols", [])
+    bottom_drivers = per_asset_drivers.get("bottom_drivers", {})
     for entry in bottom_symbols:
-        sym = entry['symbol']
-        rank = entry['predicted_rank']
+        sym = entry["symbol"]
+        rank = entry["predicted_rank"]
         drivers = bottom_drivers.get(sym, {})
-        driver_str = ", ".join([f"{k}: {v}" for k, v in drivers.items()]) if drivers else "No extreme features"
+        driver_str = (
+            ", ".join([f"{k}: {v}" for k, v in drivers.items()])
+            if drivers
+            else "No extreme features"
+        )
         lines.append(f"  {sym:15s} (rank: {rank:.4f}) → {driver_str}")
 
     # Section 4: Model Metadata
     lines.append("\n## 5. MODEL TRAINING METADATA")
     lines.append(f"  Validation RMSE:       {model_meta.get('validation_rmse', 'N/A')}")
-    lines.append(f"  Spearman Correlation:  {model_meta.get('validation_spearman', 'N/A')}")
-    lines.append(f"  Spearman p-value:      {model_meta.get('spearman_p_value', 'N/A')}")
+    lines.append(
+        f"  Spearman Correlation:  {model_meta.get('validation_spearman', 'N/A')}"
+    )
+    lines.append(
+        f"  Spearman p-value:      {model_meta.get('spearman_p_value', 'N/A')}"
+    )
 
     return "\n".join(lines)

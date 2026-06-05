@@ -1,10 +1,14 @@
 import sqlite3
 import os
 from dotenv import load_dotenv
+
 load_dotenv()
 
-DEFAULT_DB_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "alpha_factory.db")
+DEFAULT_DB_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(__file__)), "alpha_factory.db"
+)
 DB_PATH = os.getenv("DB_PATH", DEFAULT_DB_PATH)
+
 
 def get_connection():
     """Returns a connection to the SQLite database with WAL and performance settings."""
@@ -17,10 +21,11 @@ def get_connection():
     conn.execute("PRAGMA synchronous = NORMAL;")
     return conn
 
+
 def init_db():
     conn = get_connection()
     # OHLCV Table - Stores the actual candle data
-    conn.execute('''
+    conn.execute("""
         CREATE TABLE IF NOT EXISTS ohlcv (
             timestamp INTEGER,
             symbol TEXT,
@@ -33,10 +38,10 @@ def init_db():
             volume REAL,
             PRIMARY KEY (symbol, timeframe, market, timestamp)
         )
-    ''')
+    """)
 
     # Index Price OHLCV Table
-    conn.execute('''
+    conn.execute("""
         CREATE TABLE IF NOT EXISTS index_ohlcv (
             timestamp INTEGER,
             symbol TEXT,
@@ -47,10 +52,10 @@ def init_db():
             close REAL,
             PRIMARY KEY (symbol, timeframe, timestamp)
         )
-    ''')
+    """)
 
     # Symbol Metrics Table
-    conn.execute('''
+    conn.execute("""
         CREATE TABLE IF NOT EXISTS symbol_metrics (
             timestamp INTEGER,
             create_time INTEGER,
@@ -65,10 +70,10 @@ def init_db():
             sum_taker_long_short_vol_ratio REAL,
             PRIMARY KEY (symbol, timestamp)
         )
-    ''')
+    """)
 
     # Funding Rate Table
-    conn.execute('''
+    conn.execute("""
         CREATE TABLE IF NOT EXISTS funding_rate (
             calc_time INTEGER,
             symbol TEXT,
@@ -76,10 +81,10 @@ def init_db():
             last_funding_rate REAL,
             PRIMARY KEY (symbol, calc_time)
         )
-    ''')
+    """)
 
     # Sync State Table - Tracks progress for smart resuming
-    conn.execute('''
+    conn.execute("""
         CREATE TABLE IF NOT EXISTS sync_state (
             symbol TEXT,
             timeframe TEXT,
@@ -89,10 +94,11 @@ def init_db():
             latest_timestamp INTEGER,
             PRIMARY KEY (symbol, timeframe, market, data_type)
         )
-    ''')
-    
+    """)
+
     conn.commit()
     conn.close()
+
 
 if __name__ == "__main__":
     init_db()

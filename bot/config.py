@@ -1,4 +1,5 @@
 import os
+
 # pyrefly: ignore [missing-import]
 from hyperliquid.utils import constants
 
@@ -12,6 +13,7 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 # --- RISK PARAMETERS ---
 MARGIN_LIMIT = 0.44
 DCA_LIMIT = 1
+POC_GRAVITY_FILTER_ACTIVE = False  # Set to True to restrict entries to POC levels
 
 # --- NETWORK ---
 TESTNET_MODE = os.environ.get("TESTNET_MODE", "False").lower() == "true"
