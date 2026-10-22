@@ -6,8 +6,8 @@ ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONPATH="${LAMBDA_TASK_ROOT}"
 
-# Install system dependencies (needed for LightGBM/XGBoost)
-RUN yum install -y libgomp gcc gcc-c++ && \
+# Install system dependencies (needed for LightGBM/XGBoost and Pillow compilation)
+RUN yum install -y libgomp gcc gcc-c++ zlib-devel libjpeg-turbo-devel && \
     yum clean all && \
     rm -rf /var/cache/yum
 
