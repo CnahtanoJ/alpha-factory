@@ -31,7 +31,7 @@ if ($LASTEXITCODE -ne 0) { Write-Error "Failed to login to ECR"; exit }
 Write-Host "Building Docker image (forcing single-platform manifest)..."
 $env:DOCKER_DEFAULT_PLATFORM = "linux/amd64"
 # Using --provenance=false to avoid the "Image Index" issue in Lambda
-docker build --platform linux/amd64 --provenance=false -t "${RepoName}" .
+docker build --platform linux/amd64 --no-cache --provenance=false -t "${RepoName}" .
 if ($LASTEXITCODE -ne 0) { Write-Error "Docker build failed"; exit }
 
 # 3. Tag the image
