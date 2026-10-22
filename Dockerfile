@@ -13,7 +13,7 @@ RUN yum install -y libgomp gcc gcc-c++ && \
 
 # Upgrade pip and install requirements
 COPY requirements.txt .
-RUN pip install --no-cache-dir --upgrade pip && \
+RUN pip install --no-cache-dir --upgrade "pip>=26.2.2" "certifi>=2026.10.19" && \
     pip install --no-cache-dir -r requirements.txt
 
 # Copy your code folders (Package structure)
